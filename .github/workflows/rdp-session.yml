@@ -34,6 +34,10 @@ jobs:
         run: |
           $sessionId = "${{ github.event.inputs.session_id }}"
           if ([string]::IsNullOrEmpty($sessionId)) {
+            # Also check client_payload when triggered via repository_dispatch
+            $sessionId = "${{ github.event.client_payload.session_id }}"
+          }
+          if ([string]::IsNullOrEmpty($sessionId)) {
             $sessionId = [guid]::NewGuid().ToString().Substring(0,8)
           }
           
