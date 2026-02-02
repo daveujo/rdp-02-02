@@ -118,9 +118,11 @@ jobs:
           Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
           
+          # UPDATED: Added --advertise-tags
           & "C:\Program Files\Tailscale\tailscale.exe" up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname="$hostname" `
+            --advertise-tags="tag:github-runner" `
             --accept-routes `
             --accept-dns
           
