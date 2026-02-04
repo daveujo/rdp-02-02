@@ -16,7 +16,7 @@ on:
 
 env:
   SESSION_TIMEOUT_MINUTES: 355  # Close to 6 hour GitHub limit
-  CHAIN_BUFFER_MINUTES: 10     # Start new session 10 min before timeout (enough for setup)
+  CHAIN_BUFFER_MINUTES: 20     # Start new session 20 min before timeout (enough for setup + artifact download)
 
 jobs:
   rdp-session:
@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Generate session info
         id: session
@@ -345,37 +345,74 @@ jobs:
           Write-Host "OpenClaw configured!"
           Write-Host "=============================================="
           
-      - name: Restore workspace from artifact
+      - name: Find previous workspace artifact
+        id: find-artifact
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $workspaceDir = "$rdpUserHome\.openclaw\workspace"
           $repo = "${{ github.repository }}"
+          $currentRunId = "${{ github.run_id }}"
           
           Write-Host "Checking for previous workspace artifact..."
+          Write-Host "Current run ID: $currentRunId"
           
-          # List artifacts and find the latest workspace artifact
-          $artifacts = gh api "repos/$repo/actions/artifacts" --jq '.artifacts[] | select(.name == "openclaw-workspace") | .id' 2>$null
+          # Check if there's another run still in progress (the one that triggered us)
+          # If so, wait for it to complete and upload its artifact
+          $maxWaitMinutes = 25
+          $waitedMinutes = 0
           
-          if ($artifacts) {
-            $latestArtifact = ($artifacts -split "`n")[0]
-            Write-Host "Found workspace artifact: $latestArtifact"
+          while ($waitedMinutes -lt $maxWaitMinutes) {
+            # Get in-progress runs (excluding current)
+            $inProgressRuns = gh run list --repo $repo --workflow "rdp-session.yml" --status in_progress --json databaseId 2>$null | ConvertFrom-Json
+            $otherInProgress = $inProgressRuns | Where-Object { $_.databaseId -ne [int64]$currentRunId }
             
-            # Download artifact
-            $zipPath = "$env:TEMP\workspace.zip"
-            gh api "repos/$repo/actions/artifacts/$latestArtifact/zip" > $zipPath
-            
-            # Extract to workspace directory
-            Expand-Archive -Path $zipPath -DestinationPath $workspaceDir -Force
-            Remove-Item $zipPath -Force
-            
-            Write-Host "Workspace restored from artifact"
-          } else {
-            Write-Host "No previous workspace artifact found, starting fresh"
+            if ($otherInProgress -and $otherInProgress.Count -gt 0) {
+              Write-Host "Previous session still running (run $($otherInProgress[0].databaseId)), waiting for it to upload artifact..."
+              Start-Sleep -Seconds 60
+              $waitedMinutes++
+            } else {
+              Write-Host "No other sessions in progress, proceeding with artifact download"
+              break
+            }
           }
           
+          if ($waitedMinutes -ge $maxWaitMinutes) {
+            Write-Host "WARNING: Timed out waiting for previous session, proceeding anyway"
+          }
+          
+          # Now find the latest artifact
+          $result = gh api "repos/$repo/actions/artifacts" --jq '[.artifacts[] | select(.name == "openclaw-workspace" and .expired == false)] | first | {id: .id, run_id: .workflow_run.id}' 2>$null | ConvertFrom-Json
+          
+          if ($result -and $result.id) {
+            Write-Host "Found workspace artifact ID: $($result.id) from run: $($result.run_id)"
+            echo "RUN_ID=$($result.run_id)" >> $env:GITHUB_OUTPUT
+            echo "FOUND=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "No previous workspace artifact found"
+            echo "FOUND=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Restore workspace from artifact
+        if: steps.find-artifact.outputs.FOUND == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: openclaw-workspace
+          path: C:\Users\rdpuser\.openclaw\workspace
+          github-token: ${{ secrets.GH_PAT }}
+          run-id: ${{ steps.find-artifact.outputs.RUN_ID }}
+        continue-on-error: true
+
+      - name: Set workspace permissions
+        shell: pwsh
+        run: |
+          $workspaceDir = "C:\Users\rdpuser\.openclaw\workspace"
+          if (Test-Path $workspaceDir) {
+            Write-Host "Workspace restored, setting permissions..."
+          } else {
+            Write-Host "No workspace restored, creating empty directory..."
+            New-Item -ItemType Directory -Path $workspaceDir -Force | Out-Null
+          }
           $null = cmd /c "icacls `"$workspaceDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
           
@@ -463,12 +500,15 @@ jobs:
           $nextChainCount = [int]"${{ steps.session.outputs.CHAIN_COUNT }}" + 1
           $repo = "${{ github.repository }}"
           $token = "${{ secrets.GH_PAT }}"
+          $rdpUserHome = "C:\Users\rdpuser"
           
           Write-Host "Chain trigger scheduled in $chainMinutes minutes"
           
-          $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(@"
+          # Create chain trigger script
+          $chainScript = @"
+          Write-Host "Triggering next session..."
           `$headers = @{
-            'Authorization' = 'Bearer $token'
+            'Authorization' = "Bearer $token"
             'Accept' = 'application/vnd.github.v3+json'
           }
           `$body = @{
@@ -478,11 +518,16 @@ jobs:
               chain_count = $nextChainCount
             }
           } | ConvertTo-Json
-          Invoke-RestMethod -Uri 'https://api.github.com/repos/$repo/dispatches' -Method Post -Headers `$headers -Body `$body -ContentType 'application/json'
-          "@))
+          
+          Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/dispatches" -Method Post -Headers `$headers -Body `$body -ContentType 'application/json'
+          Write-Host "Chain triggered! Next session will wait for this session to finish uploading artifact."
+          "@
+          
+          $scriptPath = "$rdpUserHome\chain-trigger.ps1"
+          $chainScript | Out-File -FilePath $scriptPath -Encoding UTF8
           
           $triggerTime = (Get-Date).AddMinutes($chainMinutes)
-          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -EncodedCommand $encodedCommand"
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$scriptPath`""
           $trigger = New-ScheduledTaskTrigger -Once -At $triggerTime
           $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
           
@@ -570,10 +615,42 @@ jobs:
 
       - name: Save workspace to artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: openclaw-workspace
           path: C:\Users\rdpuser\.openclaw\workspace
           retention-days: 90
           if-no-files-found: ignore
           overwrite: true
+
+      - name: Cleanup old workflow runs
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $currentRunId = "${{ github.run_id }}"
+          
+          Write-Host "Cleaning up old workflow runs (keeping 2 most recent)..."
+          
+          # Get all runs for this workflow, sorted by created_at desc
+          $runs = gh run list --repo $repo --workflow "rdp-session.yml" --limit 50 --json databaseId,status,createdAt 2>$null | ConvertFrom-Json
+          
+          if ($runs -and $runs.Count -gt 2) {
+            # Keep the 2 most recent runs (current + previous for artifact download during overlap)
+            # Delete everything else
+            $toKeep = $runs | Select-Object -First 2
+            $toDelete = $runs | Select-Object -Skip 2
+            
+            Write-Host "Keeping runs: $($toKeep.databaseId -join ', ')"
+            
+            foreach ($run in $toDelete) {
+              Write-Host "Deleting old run: $($run.databaseId) (created: $($run.createdAt))"
+              gh run delete $run.databaseId --repo $repo 2>$null
+            }
+            Write-Host "Deleted $($toDelete.Count) old run(s)"
+          } else {
+            Write-Host "No old runs to clean up (keeping 2 most recent)"
+          }
+        continue-on-error: true
