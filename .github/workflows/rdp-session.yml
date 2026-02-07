@@ -641,6 +641,79 @@ jobs:
           Write-Host "Secrets saved!"
         continue-on-error: true
 
+      - name: Clean workspace before upload
+        shell: pwsh
+        run: |
+          $workspace = "C:\Users\rdpuser\.openclaw\workspace"
+          
+          if (-not (Test-Path $workspace)) {
+            Write-Host "No workspace to clean"
+            exit 0
+          }
+          
+          Write-Host "Cleaning transient/large files from workspace before upload..."
+          
+          # Remove known transient directories (downloads, temp, cache, etc.)
+          $transientDirs = @(
+            "downloads", "*/downloads",
+            "temp", "*/temp", "*/tmp",
+            "cache", "*/cache", "*/.cache",
+            "node_modules", "*/node_modules",
+            "__pycache__", "*/__pycache__",
+            ".venv", "*/.venv",
+            "venv", "*/venv"
+          )
+          foreach ($pattern in $transientDirs) {
+            Get-ChildItem -Path $workspace -Directory -Recurse -Filter ($pattern.Split("/")[-1]) -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "  Removing dir: $($_.FullName)"
+              Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          
+          # Remove large media/binary files (>50MB or known extensions)
+          $largeExtensions = @("*.mp4", "*.mkv", "*.avi", "*.mov", "*.webm", "*.mp3", "*.wav", "*.flac",
+                               "*.zip", "*.tar", "*.gz", "*.7z", "*.rar",
+                               "*.iso", "*.img", "*.exe", "*.msi",
+                               "*.bin", "*.dat", "*.psd", "*.raw")
+          foreach ($ext in $largeExtensions) {
+            Get-ChildItem -Path $workspace -Recurse -Filter $ext -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "  Removing file: $($_.FullName) ($([math]::Round($_.Length/1MB, 1)) MB)"
+              Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+          }
+          
+          # Remove any files >50MB that slipped through
+          Get-ChildItem -Path $workspace -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 50MB } | ForEach-Object {
+            Write-Host "  Removing large file: $($_.FullName) ($([math]::Round($_.Length/1MB, 1)) MB)"
+            Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+          }
+          
+          # Remove broken symlinks and validate all files are accessible
+          Get-ChildItem -Path $workspace -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+              $null = [System.IO.File]::OpenRead($_.FullName).Close()
+            } catch {
+              Write-Host "  Removing inaccessible file: $($_.FullName)"
+              Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+          }
+          
+          # Remove empty directories left behind
+          do {
+            $emptyDirs = Get-ChildItem -Path $workspace -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { @(Get-ChildItem -Path $_.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0 }
+            $emptyDirs | ForEach-Object {
+              Write-Host "  Removing empty dir: $($_.FullName)"
+              Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+          } while ($emptyDirs -and $emptyDirs.Count -gt 0)
+          
+          # Summary
+          $fileCount = (Get-ChildItem -Path $workspace -Recurse -File -ErrorAction SilentlyContinue).Count
+          $totalSize = (Get-ChildItem -Path $workspace -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+          $sizeMB = [math]::Round($totalSize / 1MB, 1)
+          Write-Host "Workspace ready for upload: $fileCount files, ${sizeMB} MB"
+
       - name: Upload workspace artifact (for next session)
         uses: actions/upload-artifact@v6
         with:
