@@ -1,4 +1,4 @@
-name: Infinite RDP Session
+
 
 on:
   workflow_dispatch:
