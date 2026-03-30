@@ -24,7 +24,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -506,6 +506,28 @@ jobs:
                 $config = $configObj | ConvertTo-Json -Depth 20
                 Write-Host "  Config sanitized (removed unrecognized keys)"
               }
+              
+              # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
+              # If plugins.allow exists, 'browser' must be in the list
+              if ($configObj.plugins -and $configObj.plugins.allow) {
+                $allowList = @($configObj.plugins.allow)
+                if ($allowList -notcontains "browser") {
+                  Write-Host "  Adding 'browser' to plugins.allow list"
+                  $allowList += "browser"
+                  $configObj.plugins.allow = $allowList
+                  $config = $configObj | ConvertTo-Json -Depth 20
+                }
+              }
+              
+              # Ensure browser.enabled is true
+              if (-not $configObj.browser) {
+                $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
+              }
+              if ($configObj.browser.enabled -eq $false) {
+                Write-Host "  Enabling browser in config"
+                $configObj.browser.enabled = $true
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
             } catch {
               Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
             }
@@ -596,8 +618,18 @@ jobs:
           
           # Install the extension files
           Write-Host "Installing OpenClaw browser extension..."
-          $installOutput = openclaw browser extension install 2>&1 | Out-String
-          Write-Host $installOutput
+          
+          # Check openclaw version and browser command availability
+          $ocVersion = openclaw --version 2>&1 | Out-String
+          Write-Host "OpenClaw version: $ocVersion"
+          
+          $browserHelp = openclaw browser --help 2>&1 | Out-String
+          Write-Host "Browser command help:`n$browserHelp"
+          
+          # The extension subcommand may have different syntax depending on version
+          # Try 'openclaw browser extension' first (it may auto-install or show subcommands)
+          $installOutput = openclaw browser extension 2>&1 | Out-String
+          Write-Host "Extension output: $installOutput"
           
           # Check all possible locations for the extension directory
           $candidates = @(
@@ -802,12 +834,21 @@ jobs:
           # Use new headless mode (harder to detect than legacy headless)
           $env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"
           
-          # Start the openclaw browser profile
-          openclaw browser --browser-profile openclaw start 2>&1
+          # Start the openclaw browser (flag goes BEFORE subcommand per docs)
+          # Try with --browser-profile first, fall back to default if not supported
+          $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
+          if ($startOutput -match "unknown option") {
+            Write-Host "WARNING: --browser-profile not supported, trying without profile flag..."
+            $startOutput = openclaw browser start 2>&1 | Out-String
+          }
+          Write-Host "Browser start output: $startOutput"
           Start-Sleep -Seconds 5
           
           # Check browser status
-          $browserStatus = openclaw browser --browser-profile openclaw status 2>&1
+          $browserStatus = openclaw browser --browser-profile openclaw status 2>&1 | Out-String
+          if ($browserStatus -match "unknown option") {
+            $browserStatus = openclaw browser status 2>&1 | Out-String
+          }
           Write-Host "Browser status: $browserStatus"
           
           # Verify CDP is reachable on the configured port
