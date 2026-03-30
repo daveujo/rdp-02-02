@@ -499,16 +499,22 @@ if ((Test-Path $OPENCLAW_JSON) -and (Test-Path $PLUGIN_INSTALL_DIR)) {
         $pluginPath = $PLUGIN_INSTALL_DIR -replace '\\', '/'
         if (-not $config.plugins.installs.'google-antigravity-auth') {
             $config.plugins.installs | Add-Member -NotePropertyName "google-antigravity-auth" -NotePropertyValue ([PSCustomObject]@{
-                source = $pluginPath
+                source = "path"
+                location = $pluginPath
             }) -Force
-            Log "openclaw.json -- added plugin install source: $pluginPath"
+            Log "openclaw.json -- added plugin install: source=path, location=$pluginPath"
         } else {
-            # Remove old 'path' key if exists, use 'source' instead
-            if ($config.plugins.installs.'google-antigravity-auth'.PSObject.Properties['path']) {
-                $config.plugins.installs.'google-antigravity-auth'.PSObject.Properties.Remove('path')
+            # Fix keys to use correct format
+            $entry = $config.plugins.installs.'google-antigravity-auth'
+            # Remove old invalid keys
+            @('path') | ForEach-Object {
+                if ($entry.PSObject.Properties[$_]) {
+                    $entry.PSObject.Properties.Remove($_)
+                }
             }
-            $config.plugins.installs.'google-antigravity-auth' | Add-Member -NotePropertyName "source" -NotePropertyValue $pluginPath -Force
-            Warn "openclaw.json -- updated google-antigravity-auth install source"
+            $entry | Add-Member -NotePropertyName "source" -NotePropertyValue "path" -Force
+            $entry | Add-Member -NotePropertyName "location" -NotePropertyValue $pluginPath -Force
+            Warn "openclaw.json -- updated google-antigravity-auth install config"
         }
         
         $config | ConvertTo-Json -Depth 20 | Out-File -FilePath $OPENCLAW_JSON -Encoding UTF8
