@@ -471,34 +471,40 @@ if ((Test-Path $OPENCLAW_JSON) -and (Test-Path $PLUGIN_INSTALL_DIR)) {
             $config | Add-Member -NotePropertyName "plugins" -NotePropertyValue ([PSCustomObject]@{}) -Force
         }
         
-        # Ensure plugins.allow array exists and includes google-antigravity-auth
-        if (-not $config.plugins.allow) {
-            $config.plugins | Add-Member -NotePropertyName "allow" -NotePropertyValue @() -Force
+        # Ensure plugins.entries exists and has google-antigravity-auth enabled
+        if (-not $config.plugins.entries) {
+            $config.plugins | Add-Member -NotePropertyName "entries" -NotePropertyValue ([PSCustomObject]@{}) -Force
         }
-        if ($config.plugins.allow -isnot [System.Array]) {
-            $config.plugins.allow = @($config.plugins.allow)
-        }
-        if ("google-antigravity-auth" -notin $config.plugins.allow) {
-            $config.plugins.allow += "google-antigravity-auth"
-            Log "openclaw.json -- added google-antigravity-auth to plugins.allow"
+        if (-not $config.plugins.entries.'google-antigravity-auth') {
+            $config.plugins.entries | Add-Member -NotePropertyName "google-antigravity-auth" -NotePropertyValue ([PSCustomObject]@{
+                enabled = $true
+            }) -Force
+            Log "openclaw.json -- added google-antigravity-auth to plugins.entries"
         } else {
-            Warn "openclaw.json -- google-antigravity-auth already in plugins.allow"
+            # Ensure it's enabled
+            $config.plugins.entries.'google-antigravity-auth'.enabled = $true
+            Warn "openclaw.json -- google-antigravity-auth already in plugins.entries, ensured enabled=true"
         }
         
-        # Ensure plugins.installs array exists and includes the plugin path
+        # Ensure plugins.installs is an OBJECT (not array) with plugin path as key
+        # Format: { "google-antigravity-auth": { "path": "..." } }
         if (-not $config.plugins.installs) {
-            $config.plugins | Add-Member -NotePropertyName "installs" -NotePropertyValue @() -Force
+            $config.plugins | Add-Member -NotePropertyName "installs" -NotePropertyValue ([PSCustomObject]@{}) -Force
         }
-        if ($config.plugins.installs -isnot [System.Array]) {
-            $config.plugins.installs = @($config.plugins.installs)
+        # If installs is an array (from previous bad config), convert to object
+        if ($config.plugins.installs -is [System.Array]) {
+            $config.plugins.installs = [PSCustomObject]@{}
+            Warn "openclaw.json -- converted plugins.installs from array to object"
         }
         $pluginPath = $PLUGIN_INSTALL_DIR -replace '\\', '/'
-        $alreadyInstalled = $config.plugins.installs | Where-Object { $_ -like "*google-antigravity-auth*" }
-        if (-not $alreadyInstalled) {
-            $config.plugins.installs += $pluginPath
+        if (-not $config.plugins.installs.'google-antigravity-auth') {
+            $config.plugins.installs | Add-Member -NotePropertyName "google-antigravity-auth" -NotePropertyValue ([PSCustomObject]@{
+                path = $pluginPath
+            }) -Force
             Log "openclaw.json -- added plugin install path: $pluginPath"
         } else {
-            Warn "openclaw.json -- google-antigravity-auth install path already present"
+            $config.plugins.installs.'google-antigravity-auth'.path = $pluginPath
+            Warn "openclaw.json -- updated google-antigravity-auth install path"
         }
         
         $config | ConvertTo-Json -Depth 20 | Out-File -FilePath $OPENCLAW_JSON -Encoding UTF8
