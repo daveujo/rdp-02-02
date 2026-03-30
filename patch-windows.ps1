@@ -402,7 +402,112 @@ else {
 }
 
 # =============================================================================
-# 6. Validate patched JS files parse correctly
+# 6. Install google-antigravity-auth plugin from backup zip
+# =============================================================================
+$PLUGIN_ZIP = Join-Path $env:GITHUB_WORKSPACE "google-antigravity-auth-backup.zip"
+$PLUGIN_INSTALL_DIR = Join-Path $rdpUserHome ".openclaw\extensions\google-antigravity-auth"
+
+if (Test-Path $PLUGIN_ZIP) {
+    if ($DryRun) {
+        Log "[DRY RUN] Would install google-antigravity-auth plugin from $PLUGIN_ZIP"
+    }
+    else {
+        # Create extensions directory if needed
+        $extensionsDir = Split-Path $PLUGIN_INSTALL_DIR -Parent
+        New-Item -ItemType Directory -Path $extensionsDir -Force | Out-Null
+        
+        # Remove old plugin if exists
+        if (Test-Path $PLUGIN_INSTALL_DIR) {
+            Remove-Item -Path $PLUGIN_INSTALL_DIR -Recurse -Force
+            Warn "Removed existing google-antigravity-auth plugin"
+        }
+        
+        # Extract zip to extensions directory
+        Write-Host "Extracting google-antigravity-auth plugin..."
+        Expand-Archive -Path $PLUGIN_ZIP -DestinationPath $extensionsDir -Force
+        
+        # Handle case where zip contains a nested folder
+        $extractedItems = Get-ChildItem -Path $extensionsDir -Directory | Where-Object { $_.Name -like "*antigravity*" -or $_.Name -like "*backup*" }
+        if ($extractedItems.Count -eq 1 -and $extractedItems[0].FullName -ne $PLUGIN_INSTALL_DIR) {
+            # Rename to standard plugin name
+            Rename-Item -Path $extractedItems[0].FullName -NewName "google-antigravity-auth" -Force
+        }
+        
+        if (Test-Path $PLUGIN_INSTALL_DIR) {
+            Log "google-antigravity-auth plugin installed to $PLUGIN_INSTALL_DIR"
+            
+            # List plugin contents for verification
+            $pluginFiles = Get-ChildItem -Path $PLUGIN_INSTALL_DIR -Recurse -File | Select-Object -First 10
+            foreach ($pf in $pluginFiles) {
+                Write-Host "    $($pf.Name)"
+            }
+        } else {
+            Warn "Plugin extraction completed but directory not found at expected path"
+            Write-Host "  Contents of $extensionsDir`:"
+            Get-ChildItem -Path $extensionsDir | ForEach-Object { Write-Host "    $($_.Name)" }
+        }
+        
+        # Grant rdpuser access
+        $null = cmd /c "icacls `"$extensionsDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
+        $global:LASTEXITCODE = 0
+    }
+}
+else {
+    Warn "google-antigravity-auth-backup.zip not found at $PLUGIN_ZIP -- skipping plugin install"
+}
+
+# =============================================================================
+# 7. Update openclaw.json to enable google-antigravity-auth plugin
+# =============================================================================
+if ((Test-Path $OPENCLAW_JSON) -and (Test-Path $PLUGIN_INSTALL_DIR)) {
+    if ($DryRun) {
+        Log "[DRY RUN] Would enable google-antigravity-auth plugin in openclaw.json"
+    }
+    else {
+        $config = Get-Content -Path $OPENCLAW_JSON -Raw -Encoding UTF8 | ConvertFrom-Json
+        
+        # Ensure plugins section exists
+        if (-not $config.plugins) {
+            $config | Add-Member -NotePropertyName "plugins" -NotePropertyValue ([PSCustomObject]@{}) -Force
+        }
+        
+        # Ensure plugins.allow array exists and includes google-antigravity-auth
+        if (-not $config.plugins.allow) {
+            $config.plugins | Add-Member -NotePropertyName "allow" -NotePropertyValue @() -Force
+        }
+        if ($config.plugins.allow -isnot [System.Array]) {
+            $config.plugins.allow = @($config.plugins.allow)
+        }
+        if ("google-antigravity-auth" -notin $config.plugins.allow) {
+            $config.plugins.allow += "google-antigravity-auth"
+            Log "openclaw.json -- added google-antigravity-auth to plugins.allow"
+        } else {
+            Warn "openclaw.json -- google-antigravity-auth already in plugins.allow"
+        }
+        
+        # Ensure plugins.installs array exists and includes the plugin path
+        if (-not $config.plugins.installs) {
+            $config.plugins | Add-Member -NotePropertyName "installs" -NotePropertyValue @() -Force
+        }
+        if ($config.plugins.installs -isnot [System.Array]) {
+            $config.plugins.installs = @($config.plugins.installs)
+        }
+        $pluginPath = $PLUGIN_INSTALL_DIR -replace '\\', '/'
+        $alreadyInstalled = $config.plugins.installs | Where-Object { $_ -like "*google-antigravity-auth*" }
+        if (-not $alreadyInstalled) {
+            $config.plugins.installs += $pluginPath
+            Log "openclaw.json -- added plugin install path: $pluginPath"
+        } else {
+            Warn "openclaw.json -- google-antigravity-auth install path already present"
+        }
+        
+        $config | ConvertTo-Json -Depth 20 | Out-File -FilePath $OPENCLAW_JSON -Encoding UTF8
+        Log "openclaw.json updated with google-antigravity-auth plugin configuration"
+    }
+}
+
+# =============================================================================
+# 8. Validate patched JS files parse correctly
 # =============================================================================
 Write-Host ""
 Write-Host "Validating patched files..."
