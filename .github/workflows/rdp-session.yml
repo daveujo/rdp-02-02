@@ -15,10 +15,6 @@ on:
         description: 'Bump to force openclaw upgrade (e.g. v1 -> v2)'
         required: false
         default: 'v1'
-      openclaw_config_url:
-        description: 'Raw URL to openclaw.json config (e.g. pastebin/raw gist link)'
-        required: false
-        default: ''
   repository_dispatch:
     types: [chain-rdp]
 
@@ -53,7 +49,6 @@ jobs:
           
           # Resolve openclaw cache version (from input or chained payload)
           $openclawCacheVersion = "${{ github.event.inputs.openclaw_cache_version }}"
-          $openclawConfigUrl = "${{ github.event.inputs.openclaw_config_url }}"
           
           if ("${{ github.event_name }}" -eq "repository_dispatch") {
             $payloadCount = "${{ github.event.client_payload.chain_count }}"
@@ -63,10 +58,6 @@ jobs:
             $payloadCacheVersion = "${{ github.event.client_payload.openclaw_cache_version }}"
             if (-not [string]::IsNullOrEmpty($payloadCacheVersion)) {
               $openclawCacheVersion = $payloadCacheVersion
-            }
-            $payloadConfigUrl = "${{ github.event.client_payload.openclaw_config_url }}"
-            if (-not [string]::IsNullOrEmpty($payloadConfigUrl)) {
-              $openclawConfigUrl = $payloadConfigUrl
             }
           }
           
@@ -80,7 +71,6 @@ jobs:
           echo "SESSION_ID=$sessionId" >> $env:GITHUB_OUTPUT
           echo "CHAIN_COUNT=$chainCount" >> $env:GITHUB_OUTPUT
           echo "OPENCLAW_CACHE_VERSION=$openclawCacheVersion" >> $env:GITHUB_OUTPUT
-          echo "OPENCLAW_CONFIG_URL=$openclawConfigUrl" >> $env:GITHUB_OUTPUT
           echo "JOB_START_TICKS=$jobStartTicks" >> $env:GITHUB_OUTPUT
           
           Write-Host "Session: $sessionId | Chain: $chainCount | Cache: $openclawCacheVersion"
@@ -473,14 +463,13 @@ jobs:
       - name: Configure OpenClaw
         shell: pwsh
         env:
-          OPENCLAW_CONFIG_URL: ${{ steps.session.outputs.OPENCLAW_CONFIG_URL }}
-          OPENCLAW_AUTH_PROFILES: ${{ secrets.OPENCLAW_AUTH_PROFILES }}
+          OPENCLAW_CONFIG_URL: ${{ secrets.OPENCLAW_CONFIG }}
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $openclawDir = "$rdpUserHome\.openclaw"
           
           if (-not $env:OPENCLAW_CONFIG_URL) {
-            Write-Host "ERROR: Missing openclaw_config_url input/client_payload value"
+            Write-Host "ERROR: Missing OPENCLAW_CONFIG secret (expected raw config URL)"
             exit 1
           }
 
@@ -560,14 +549,6 @@ jobs:
           
           $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
           Write-Host "Injected openclaw.json from URL (paths fixed to $rdpUserHome)"
-          
-          # Inject auth-profiles.json from secret
-          if ($env:OPENCLAW_AUTH_PROFILES) {
-            $env:OPENCLAW_AUTH_PROFILES | Out-File -FilePath "$openclawDir\agents\main\agent\auth-profiles.json" -Encoding UTF8
-            Write-Host "Injected auth-profiles.json from secret"
-          } else {
-            Write-Host "WARNING: No OPENCLAW_AUTH_PROFILES secret found"
-          }
           
           $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
@@ -986,13 +967,9 @@ jobs:
           # Helper: save secrets to GitHub
           function Save-Secrets {
             $configFile = "$rdpUserHome\.openclaw\openclaw.json"
-            $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
             try {
               if (Test-Path $configFile) {
                 Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo 2>&1 | Out-Null
-              }
-              if (Test-Path $authFile) {
-                Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo 2>&1 | Out-Null
               }
               Write-Host "  [SAVE] Secrets saved at $(Get-Date -Format 'HH:mm:ss')"
             } catch {
@@ -1250,15 +1227,11 @@ jobs:
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
           $configFile = "$rdpUserHome\.openclaw\openclaw.json"
-          $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
           
           Write-Host "Fallback secret save (in case keepalive was interrupted)..."
           try {
             if (Test-Path $configFile) {
               Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo
-            }
-            if (Test-Path $authFile) {
-              Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo
             }
             Write-Host "Secrets saved"
           } catch {
