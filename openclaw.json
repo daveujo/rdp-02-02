@@ -1,0 +1,38 @@
+{
+  "apiKeys": {
+    "google-antigravity": "",
+    "openai": "",
+    "anthropic": "",
+    "google": "",
+    "xai": "",
+    "mistral": "",
+    "groq": "",
+    "openrouter": ""
+  },
+  "agents": {
+    "defaults": {
+      "models": {
+        "google-antigravity/gemini-3.1-pro-high": {},
+        "google-antigravity/gemini-3-flash": {},
+        "google-antigravity/claude-opus-4-6-thinking": {},
+        "google-antigravity/claude-sonnet-4-6-thinking": {},
+        "google-antigravity/gpt-oss-120b-medium": {}
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "google-antigravity": {
+        "models": []
+      }
+    }
+  },
+  "plugins": {
+    "allow": [
+      "browser"
+    ]
+  },
+  "browser": {
+    "enabled": true
+  }
+}

@@ -468,75 +468,135 @@ jobs:
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $openclawDir = "$rdpUserHome\.openclaw"
+          $repoTemplate = Join-Path $env:GITHUB_WORKSPACE "openclaw.json"
+          $targetConfig = "$openclawDir\openclaw.json"
           
-          # Inject openclaw.json from secret
+          if (-not (Test-Path $repoTemplate)) {
+            Write-Host "ERROR: Repo template not found at $repoTemplate"
+            exit 1
+          }
+
+          Copy-Item -Path $repoTemplate -Destination $targetConfig -Force
+          $config = Get-Content $targetConfig -Raw -Encoding UTF8
+          Write-Host "Copied baseline openclaw.json from repository"
+
+          function Merge-ConfigObjects {
+            param(
+              [Parameter(Mandatory = $true)][object]$Base,
+              [Parameter(Mandatory = $true)][object]$Override
+            )
+
+            foreach ($prop in $Override.PSObject.Properties) {
+              $name = $prop.Name
+              $overrideVal = $prop.Value
+              $baseProp = $Base.PSObject.Properties[$name]
+
+              if ($baseProp) {
+                $baseVal = $baseProp.Value
+                if (($baseVal -is [System.Management.Automation.PSCustomObject]) -and ($overrideVal -is [System.Management.Automation.PSCustomObject])) {
+                  [void](Merge-ConfigObjects -Base $baseVal -Override $overrideVal)
+                } else {
+                  $Base | Add-Member -NotePropertyName $name -NotePropertyValue $overrideVal -Force
+                }
+              } else {
+                $Base | Add-Member -NotePropertyName $name -NotePropertyValue $overrideVal -Force
+              }
+            }
+
+            return $Base
+          }
+
+          # Inject secret overrides on top of baseline template
           if ($env:OPENCLAW_CONFIG) {
-            # Fix paths: replace any user home path with rdpuser path
-            $config = $env:OPENCLAW_CONFIG
-            $config = $config -replace 'C:\\\\Users\\\\[^\\\"]+', ($rdpUserHome -replace '\\', '\\\\')
-            $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
-            
-            # Sanitize: remove unrecognized keys from model entries that crash OpenClaw
-            # (e.g. "remoteId" added by OpenClaw runtime but rejected on startup)
             try {
-              $configObj = $config | ConvertFrom-Json
-              $sanitizedKeys = @("remoteId", "remote_id")  # Known offenders
-              $didSanitize = $false
-              
-              if ($configObj.models.providers) {
-                foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
-                  $provider = $providerProp.Value
-                  if ($provider.models -and $provider.models -is [System.Array]) {
-                    for ($i = 0; $i -lt $provider.models.Count; $i++) {
-                      $model = $provider.models[$i]
-                      foreach ($badKey in $sanitizedKeys) {
-                        if ($model.PSObject.Properties[$badKey]) {
-                          Write-Host "  SANITIZE: Removing '$badKey' from $($providerProp.Name).models[$i]"
-                          $model.PSObject.Properties.Remove($badKey)
-                          $didSanitize = $true
-                        }
+              $baseObj = $config | ConvertFrom-Json
+            } catch {
+              Write-Host "ERROR: Baseline openclaw.json is not valid JSON: $_"
+              exit 1
+            }
+
+            $overrideRaw = $env:OPENCLAW_CONFIG
+            $overrideObj = $null
+
+            try {
+              $overrideObj = $overrideRaw | ConvertFrom-Json
+            } catch {
+              # Allow "key chunk" style secret without outer braces
+              try {
+                $overrideObj = ("{" + [Environment]::NewLine + $overrideRaw + [Environment]::NewLine + "}") | ConvertFrom-Json
+              } catch {
+                Write-Host "ERROR: OPENCLAW_CONFIG override is not valid JSON (full object or key-chunk)."
+                exit 1
+              }
+            }
+
+            $merged = Merge-ConfigObjects -Base $baseObj -Override $overrideObj
+            $config = $merged | ConvertTo-Json -Depth 50
+            Write-Host "Applied OPENCLAW_CONFIG secret overrides"
+          } else {
+            Write-Host "No OPENCLAW_CONFIG override found - using repository baseline only"
+          }
+
+          # Fix paths: replace any user home path with rdpuser path
+          $config = $config -replace 'C:\\\\Users\\\\[^\\\"]+', ($rdpUserHome -replace '\\', '\\\\')
+          $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
+
+          # Sanitize: remove unrecognized keys from model entries that crash OpenClaw
+          # (e.g. "remoteId" added by OpenClaw runtime but rejected on startup)
+          try {
+            $configObj = $config | ConvertFrom-Json
+            $sanitizedKeys = @("remoteId", "remote_id")  # Known offenders
+            $didSanitize = $false
+            
+            if ($configObj.models.providers) {
+              foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
+                $provider = $providerProp.Value
+                if ($provider.models -and $provider.models -is [System.Array]) {
+                  for ($i = 0; $i -lt $provider.models.Count; $i++) {
+                    $model = $provider.models[$i]
+                    foreach ($badKey in $sanitizedKeys) {
+                      if ($model.PSObject.Properties[$badKey]) {
+                        Write-Host "  SANITIZE: Removing '$badKey' from $($providerProp.Name).models[$i]"
+                        $model.PSObject.Properties.Remove($badKey)
+                        $didSanitize = $true
                       }
                     }
                   }
                 }
               }
-              
-              if ($didSanitize) {
-                $config = $configObj | ConvertTo-Json -Depth 20
-                Write-Host "  Config sanitized (removed unrecognized keys)"
-              }
-              
-              # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
-              # If plugins.allow exists, 'browser' must be in the list
-              if ($configObj.plugins -and $configObj.plugins.allow) {
-                $allowList = @($configObj.plugins.allow)
-                if ($allowList -notcontains "browser") {
-                  Write-Host "  Adding 'browser' to plugins.allow list"
-                  $allowList += "browser"
-                  $configObj.plugins.allow = $allowList
-                  $config = $configObj | ConvertTo-Json -Depth 20
-                }
-              }
-              
-              # Ensure browser.enabled is true
-              if (-not $configObj.browser) {
-                $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
-              }
-              if ($configObj.browser.enabled -eq $false) {
-                Write-Host "  Enabling browser in config"
-                $configObj.browser.enabled = $true
-                $config = $configObj | ConvertTo-Json -Depth 20
-              }
-            } catch {
-              Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
             }
             
-            $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
-            Write-Host "Injected openclaw.json from secret (paths fixed to $rdpUserHome)"
-          } else {
-            Write-Host "ERROR: No OPENCLAW_CONFIG secret found"
-            exit 1
+            if ($didSanitize) {
+              $config = $configObj | ConvertTo-Json -Depth 20
+              Write-Host "  Config sanitized (removed unrecognized keys)"
+            }
+            
+            # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
+            # If plugins.allow exists, 'browser' must be in the list
+            if ($configObj.plugins -and $configObj.plugins.allow) {
+              $allowList = @($configObj.plugins.allow)
+              if ($allowList -notcontains "browser") {
+                Write-Host "  Adding 'browser' to plugins.allow list"
+                $allowList += "browser"
+                $configObj.plugins.allow = $allowList
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
+            }
+            
+            # Ensure browser.enabled is true
+            if (-not $configObj.browser) {
+              $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
+            }
+            if ($configObj.browser.enabled -eq $false) {
+              Write-Host "  Enabling browser in config"
+              $configObj.browser.enabled = $true
+              $config = $configObj | ConvertTo-Json -Depth 20
+            }
+          } catch {
+            Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
           }
+
+          $config | Out-File -FilePath $targetConfig -Encoding UTF8
           
           # Inject auth-profiles.json from secret
           if ($env:OPENCLAW_AUTH_PROFILES) {
@@ -962,16 +1022,12 @@ jobs:
           
           # Helper: save secrets to GitHub
           function Save-Secrets {
-            $configFile = "$rdpUserHome\.openclaw\openclaw.json"
             $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
             try {
-              if (Test-Path $configFile) {
-                Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo 2>&1 | Out-Null
-              }
               if (Test-Path $authFile) {
                 Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo 2>&1 | Out-Null
               }
-              Write-Host "  [SAVE] Secrets saved at $(Get-Date -Format 'HH:mm:ss')"
+              Write-Host "  [SAVE] Sensitive secrets saved at $(Get-Date -Format 'HH:mm:ss')"
             } catch {
               Write-Host "  [SAVE] WARNING: Secret save failed: $_"
             }
@@ -1226,18 +1282,14 @@ jobs:
         run: |
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
-          $configFile = "$rdpUserHome\.openclaw\openclaw.json"
           $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
           
-          Write-Host "Fallback secret save (in case keepalive was interrupted)..."
+          Write-Host "Fallback sensitive secret save (in case keepalive was interrupted)..."
           try {
-            if (Test-Path $configFile) {
-              Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo
-            }
             if (Test-Path $authFile) {
               Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo
             }
-            Write-Host "Secrets saved"
+            Write-Host "Sensitive secrets saved"
           } catch {
             Write-Host "WARNING: Secret save failed: $_"
           }
