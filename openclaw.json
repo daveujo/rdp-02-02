@@ -1,0 +1,384 @@
+name: Infinite RDP Session
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: 'Session identifier (auto-generated for chains)'
+        required: false
+        default: ''
+      chain_count:
+        description: 'Chain iteration counter'
+        required: false
+        default: '0'
+      openclaw_cache_version:
+        description: 'Bump to force openclaw upgrade (e.g. v1 -> v2)'
+        required: false
+        default: 'v1'
+  repository_dispatch:
+    types: [chain-rdp]
+
+env:
+  CHAIN_TRIGGER_MINUTES: 335
+  SAVE_INTERVAL_MINUTES: 60
+
+jobs:
+  rdp-session:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Generate session info
+        id: session
+        shell: pwsh
+        run: |
+          $sessionId = "${{ github.event.inputs.session_id }}"
+          if ([string]::IsNullOrEmpty($sessionId)) { $sessionId = [guid]::NewGuid().ToString().Substring(0,8) }
+          $chainCountInput = "${{ github.event.inputs.chain_count }}"
+          if ([string]::IsNullOrEmpty($chainCountInput)) { $chainCount = 0 } else { $chainCount = [int]$chainCountInput }
+          $openclawCacheVersion = "${{ github.event.inputs.openclaw_cache_version }}"
+          if ("${{ github.event_name }}" -eq "repository_dispatch") {
+            $payloadCount = "${{ github.event.client_payload.chain_count }}"
+            if (-not [string]::IsNullOrEmpty($payloadCount)) { $chainCount = [int]$payloadCount }
+            $payloadCacheVersion = "${{ github.event.client_payload.openclaw_cache_version }}"
+            if (-not [string]::IsNullOrEmpty($payloadCacheVersion)) { $openclawCacheVersion = $payloadCacheVersion }
+          }
+          if ([string]::IsNullOrEmpty($openclawCacheVersion)) { $openclawCacheVersion = "v1" }
+          $jobStartTicks = (Get-Date).Ticks
+          echo "SESSION_ID=$sessionId" >> $env:GITHUB_OUTPUT
+          echo "CHAIN_COUNT=$chainCount" >> $env:GITHUB_OUTPUT
+          echo "OPENCLAW_CACHE_VERSION=$openclawCacheVersion" >> $env:GITHUB_OUTPUT
+          echo "JOB_START_TICKS=$jobStartTicks" >> $env:GITHUB_OUTPUT
+
+      - name: Restore Tailscale installer cache
+        id: cache-tailscale
+        uses: actions/cache/restore@v5
+        with:
+          path: C:\tailscale-cache
+          key: tailscale-v1-${{ runner.os }}
+
+      - name: Restore npm global packages cache
+        id: cache-npm-global
+        uses: actions/cache/restore@v5
+        with:
+          path: C:\Users\rdpuser\.npm-global
+          key: npm-global-openclaw-${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}-${{ runner.os }}
+
+      - name: Restore CloakBrowser cache
+        id: cache-cloakbrowser
+        uses: actions/cache/restore@v5
+        with:
+          path: C:\Users\rdpuser\.cloakbrowser
+          key: cloakbrowser-v1-${{ runner.os }}
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $cacheDir = "C:\tailscale-cache"
+          $cachedMsi = "$cacheDir\tailscale-setup.msi"
+          if (Test-Path $cachedMsi) { $installer = $cachedMsi } else { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null; Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $cachedMsi -UseBasicParsing; $installer = $cachedMsi }
+          Start-Process msiexec.exe -ArgumentList "/i", $installer, "/quiet", "/norestart" -Wait
+          echo "C:\Program Files\Tailscale" >> $env:GITHUB_PATH
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
+          $hostname = "gh-rdp-$sessionId"
+          Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="$hostname" --accept-routes --accept-dns
+
+      - name: Configure RDP Access
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=tcp localport=3389
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableClip" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableCdm" -Value 0
+
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $username = "rdpuser"
+          $password = $env:RDP_PASSWORD
+          if ([string]::IsNullOrEmpty($password)) { $password = -join ((65..90) + (97..122) + (48..57) + (33,35,36,37,38,42) | Get-Random -Count 16 | ForEach-Object {[char]$_}) }
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          try { New-LocalUser -Name $username -Password $securePassword -FullName "RDP User" -Description "GitHub Actions RDP User" -PasswordNeverExpires } catch { Set-LocalUser -Name $username -Password $securePassword }
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+      - name: Initialize rdpuser profile and environment
+        id: rdpuser
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $username = "rdpuser"
+          $password = $env:RDP_PASSWORD
+          $rdpUserHome = "C:\Users\rdpuser"
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          $credential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "echo Profile initialized" -Credential $credential -Wait -NoNewWindow -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+          $dirs = @(
+            "$rdpUserHome\projects",
+            "$rdpUserHome\.openclaw",
+            "$rdpUserHome\.openclaw\workspace",
+            "$rdpUserHome\.openclaw\agents\main\agent",
+            "$rdpUserHome\.npm-global",
+            "$rdpUserHome\.local\bin",
+            "$rdpUserHome\AppData\Roaming",
+            "$rdpUserHome\AppData\Local"
+          )
+          $dirs | ForEach-Object { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
+          [Environment]::SetEnvironmentVariable("OPENCLAW_STATE_DIR", "$rdpUserHome\.openclaw", "Machine")
+          [Environment]::SetEnvironmentVariable("OPENCLAW_WORKSPACE", "$rdpUserHome\.openclaw\workspace", "Machine")
+          [Environment]::SetEnvironmentVariable("NPM_CONFIG_PREFIX", "$rdpUserHome\.npm-global", "Machine")
+          echo "RDPUSER_HOME=$rdpUserHome" >> $env:GITHUB_OUTPUT
+
+      - name: Install Development Tools
+        shell: pwsh
+        run: |
+          $chocoCmd = Get-Command choco -ErrorAction SilentlyContinue
+          if (-not $chocoCmd) { Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')) }
+          function Install-Tool { param($Name, $ChocoPkg, $TestPath, $DirectUrl, $InstallerArgs, $InstallerType) if ($TestPath -and (Test-Path $TestPath)) { return } choco install -y $ChocoPkg --no-progress 2>&1 | Out-Null }
+          Install-Tool -Name "vscode" -ChocoPkg "vscode.install" -TestPath "C:\Program Files\Microsoft VS Code\Code.exe" -DirectUrl "https://update.code.visualstudio.com/latest/win32-x64/stable" -InstallerArgs "/verysilent /norestart /mergetasks=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" -InstallerType "exe"
+          Install-Tool -Name "notepad++" -ChocoPkg "notepadplusplus" -TestPath "C:\Program Files\Notepad++\notepad++.exe" -DirectUrl "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.7.6/npp.8.7.6.Installer.x64.exe" -InstallerArgs "/S" -InstallerType "exe"
+          Install-Tool -Name "firefox" -ChocoPkg "firefox" -TestPath "C:\Program Files\Mozilla Firefox\firefox.exe" -DirectUrl "https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=en-US" -InstallerArgs "-ms" -InstallerType "exe"
+          if (-not (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe")) { choco install -y googlechrome --ignore-checksums --no-progress 2>&1 | Out-Null }
+          $braveCandidates = @("C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", "C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe", "C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe")
+          $braveFound = $braveCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $braveFound) { choco install -y brave --no-progress 2>&1 | Out-Null }
+
+      - name: Install OpenClaw
+        shell: pwsh
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $openclawBin = "$rdpUserHome\.npm-global\node_modules\openclaw\openclaw.mjs"
+          $cacheWorking = $false
+          if ("${{ steps.cache-npm-global.outputs.cache-hit }}" -eq "true") { if (Test-Path $openclawBin) { try { $ver = node $openclawBin --version 2>&1; if ($LASTEXITCODE -eq 0) { $cacheWorking = $true } } catch {} } }
+          if (-not $cacheWorking) { npm install -g openclaw@2026.2.21 }
+          $null = cmd /c "icacls `"$rdpUserHome\.npm-global`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
+          $global:LASTEXITCODE = 0
+
+      - name: Configure OpenClaw
+        shell: pwsh
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          NVIDIA_API_KEY_3: ${{ secrets.NVIDIA_API_KEY_3 }}
+          NVIDIA_API_KEY_4: ${{ secrets.NVIDIA_API_KEY_4 }}
+          NVIDIA_API_KEY_5: ${{ secrets.NVIDIA_API_KEY_5 }}
+          NVIDIA_API_KEY_6: ${{ secrets.NVIDIA_API_KEY_6 }}
+          NVIDIA_API_KEY_7: ${{ secrets.NVIDIA_API_KEY_7 }}
+          NVIDIA_API_KEY_8: ${{ secrets.NVIDIA_API_KEY_8 }}
+          NVIDIA_API_KEY_9: ${{ secrets.NVIDIA_API_KEY_9 }}
+          NVIDIA_API_KEY_10: ${{ secrets.NVIDIA_API_KEY_10 }}
+          NVIDIA_API_KEY_11: ${{ secrets.NVIDIA_API_KEY_11 }}
+          NVIDIA_API_KEY_12: ${{ secrets.NVIDIA_API_KEY_12 }}
+          NVIDIA_API_KEY_13: ${{ secrets.NVIDIA_API_KEY_13 }}
+          NVIDIA_API_KEY_14: ${{ secrets.NVIDIA_API_KEY_14 }}
+          NVIDIA_API_KEY_15: ${{ secrets.NVIDIA_API_KEY_15 }}
+          OPENCLAW_AUTH_PROFILES: ${{ secrets.OPENCLAW_AUTH_PROFILES }}
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $openclawDir = "$rdpUserHome\.openclaw"
+          $templatePath = Join-Path $env:GITHUB_WORKSPACE "openclaw.json"
+          if (-not (Test-Path $templatePath)) { Write-Host "ERROR: openclaw.json template not found"; exit 1 }
+          $config = Get-Content $templatePath -Raw
+          for ($i = 1; $i -le 15; $i++) {
+            $name = if ($i -eq 1) { "NVIDIA_API_KEY" } else { "NVIDIA_API_KEY_$i" }
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if (-not [string]::IsNullOrEmpty($value)) {
+              $config = $config -replace [regex]::Escape("`${$name}"), $value
+            }
+          }
+          $config = $config -replace 'C:\\Users\\[^\"]+', ($rdpUserHome -replace '\\', '\\\\')
+          $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
+          try {
+            $configObj = $config | ConvertFrom-Json
+            $sanitizedKeys = @("remoteId", "remote_id")
+            if ($configObj.models.providers) {
+              foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
+                $provider = $providerProp.Value
+                if ($provider.models -and $provider.models -is [System.Array]) {
+                  foreach ($model in $provider.models) { foreach ($badKey in $sanitizedKeys) { if ($model.PSObject.Properties[$badKey]) { $model.PSObject.Properties.Remove($badKey) } } }
+                }
+              }
+            }
+            if (-not $configObj.browser) { $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force }
+            if ($configObj.browser.enabled -eq $false) { $configObj.browser.enabled = $true }
+            if ($configObj.plugins -and $configObj.plugins.allow) { $allowList = @($configObj.plugins.allow); if ($allowList -notcontains "browser") { $allowList += "browser"; $configObj.plugins.allow = $allowList } }
+            $config = $configObj | ConvertTo-Json -Depth 20
+          } catch { Write-Host "WARNING: config sanitize failed: $_" }
+          New-Item -ItemType Directory -Path $openclawDir -Force | Out-Null
+          $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
+          if ($env:OPENCLAW_AUTH_PROFILES) { New-Item -ItemType Directory -Path "$openclawDir\agents\main\agent" -Force | Out-Null; $env:OPENCLAW_AUTH_PROFILES | Out-File -FilePath "$openclawDir\agents\main\agent\auth-profiles.json" -Encoding UTF8 }
+          $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
+          $global:LASTEXITCODE = 0
+
+      - name: Patch OpenClaw (Antigravity models + endpoints)
+        shell: pwsh
+        run: |
+          $patchScript = Join-Path $env:GITHUB_WORKSPACE "patch-windows.ps1"
+          if (Test-Path $patchScript) { & $patchScript }
+
+      - name: Install Playwright and Chromium for browser control
+        shell: pwsh
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $browsersPath = "$rdpUserHome\.playwright-browsers"
+          $env:PLAYWRIGHT_BROWSERS_PATH = $browsersPath
+          $pwBin = "$rdpUserHome\.npm-global\node_modules\playwright\cli.js"
+          if (-not (Test-Path $pwBin)) { npm install -g cloakbrowser playwright-core }
+          $null = cmd /c "icacls `"$browsersPath`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
+          $global:LASTEXITCODE = 0
+
+      - name: Install OpenClaw browser extension for Brave
+        shell: pwsh
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
+          $candidates = @(
+            "$rdpUserHome\.openclaw\browser\chrome-extension",
+            "$env:USERPROFILE\.openclaw\browser\chrome-extension",
+            "C:\Users\runneradmin\.openclaw\browser\chrome-extension"
+          )
+          $extPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $extPath) { exit 0 }
+          $braveCandidates = @("C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe", "C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe", "C:\Users\rdpuser\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe")
+          $bravePath = $braveCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bravePath) { exit 0 }
+          $launchLines = @('@echo off', 'REM Launch Brave with OpenClaw extension pre-loaded', "start `"`" `"$bravePath`" --load-extension=`"$extPath`" --profile-directory=`"OpenClaw`" --no-first-run --no-default-browser-check")
+          $launchScript = $launchLines -join "`r`n"
+          $launchScriptPath = "$rdpUserHome\Desktop\Brave-OpenClaw.bat"
+          [System.IO.File]::WriteAllText($launchScriptPath, $launchScript, [System.Text.Encoding]::ASCII)
+
+      - name: Find previous workspace artifact
+        id: find-artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $currentRunId = "${{ github.run_id }}"
+          $maxWaitMinutes = 15
+          $waitedMinutes = 0
+          while ($waitedMinutes -lt $maxWaitMinutes) {
+            $inProgressRuns = gh run list --repo $repo --workflow "rdp-session.yml" --status in_progress --json databaseId 2>$null | ConvertFrom-Json
+            $otherInProgress = $inProgressRuns | Where-Object { $_.databaseId -ne [int64]$currentRunId }
+            if ($otherInProgress -and $otherInProgress.Count -gt 0) { Start-Sleep -Seconds 30; $waitedMinutes += 0.5 } else { break }
+          }
+          $result = gh api "repos/$repo/actions/artifacts" --jq '[.artifacts[] | select(.name == "openclaw-workspace" and .expired == false)] | first | {id: .id, run_id: .workflow_run.id}' 2>$null | ConvertFrom-Json
+          if ($result -and $result.id) { echo "RUN_ID=$($result.run_id)" >> $env:GITHUB_OUTPUT; echo "FOUND=true" >> $env:GITHUB_OUTPUT } else { echo "FOUND=false" >> $env:GITHUB_OUTPUT }
+
+      - name: Restore workspace from artifact
+        if: steps.find-artifact.outputs.FOUND == 'true'
+        uses: actions/download-artifact@v7
+        with:
+          name: openclaw-workspace
+          path: C:\Users\rdpuser\.openclaw\workspace
+          github-token: ${{ secrets.GH_PAT }}
+          run-id: ${{ steps.find-artifact.outputs.RUN_ID }}
+        continue-on-error: true
+
+      - name: Start OpenClaw gateway
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $password = $env:RDP_PASSWORD
+          $scriptContent = '$env:PATH = "C:\Users\rdpuser\.npm-global;" + $env:PATH' + "`r`n"
+          $scriptContent += 'Start-Process -WindowStyle Hidden -FilePath "node" -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway" -WorkingDirectory "C:\Users\rdpuser\.openclaw"' + "`r`n"
+          $scriptPath = "$rdpUserHome\start-openclaw.ps1"
+          $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
+          $batchPath = "$rdpUserHome\start-openclaw.bat"
+          '@echo off`r`npowershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Users\rdpuser\start-openclaw.ps1"' | Out-File -FilePath $batchPath -Encoding ASCII
+          $taskName = "OpenClawGateway"
+          schtasks /Create /TN $taskName /TR $batchPath /SC ONSTART /RU "rdpuser" /RP $password /RL HIGHEST /F
+          if ($LASTEXITCODE -eq 0) { schtasks /Run /TN $taskName }
+
+      - name: Start OpenClaw managed browser
+        shell: pwsh
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$rdpUserHome\.playwright-browsers"
+          $env:PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW = "1"
+          $startOutput = openclaw browser --browser-profile openclaw start 2>&1 | Out-String
+          if ($startOutput -match "unknown option") { $startOutput = openclaw browser start 2>&1 | Out-String }
+          Start-Sleep -Seconds 5
+          $browserStatus = openclaw browser --browser-profile openclaw status 2>&1 | Out-String
+          if ($browserStatus -match "unknown option") { $browserStatus = openclaw browser status 2>&1 | Out-String }
+
+      - name: Display Connection Info
+        shell: pwsh
+        run: |
+          $tailscaleIp = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
+          $chainCount = "${{ steps.session.outputs.CHAIN_COUNT }}"
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          Write-Host "Session ID: $sessionId"
+          Write-Host "Chain Count: $chainCount"
+          Write-Host "Tailscale IP: $tailscaleIp"
+          Write-Host "Hostname: gh-rdp-$sessionId"
+          Write-Host "OpenClaw Config: $rdpUserHome\.openclaw\openclaw.json"
+
+      - name: Keep session alive (phase 1 - until chain trigger)
+        id: keepalive
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $jobStart = [DateTime]::new([long]"${{ steps.session.outputs.JOB_START_TICKS }}")
+          $chainTime = $jobStart.AddMinutes(${{ env.CHAIN_TRIGGER_MINUTES }})
+          $hardLimitTime = $jobStart.AddMinutes(350)
+          $saveInterval = ${{ env.SAVE_INTERVAL_MINUTES }}
+          $rdpUserHome = "C:\Users\rdpuser"
+          $repo = "${{ github.repository }}"
+          $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
+          $chainCount = [int]"${{ steps.session.outputs.CHAIN_COUNT }}"
+          $openclawCacheVersion = "${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          $lastSaveTime = Get-Date
+          $chainTriggered = $false
+          $loopCount = 0
+          function Save-Secrets {
+            $configFile = "$rdpUserHome\.openclaw\openclaw.json"
+            $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
+            try {
+              if (Test-Path $configFile) { Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo 2>&1 | Out-Null }
+              if (Test-Path $authFile) { Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo 2>&1 | Out-Null }
+            } catch {}
+          }
+          function Trigger-Chain {
+            $nextChainCount = $chainCount + 1
+            $body = @{ event_type = 'chain-rdp'; client_payload = @{ session_id = $sessionId; chain_count = $nextChainCount; openclaw_cache_version = $openclawCacheVersion } } | ConvertTo-Json -Compress
+            $body | gh api "repos/$repo/dispatches" --method POST --input -
+          }
+          while (-not $chainTriggered) {
+            $now = Get-Date
+            if ($now -ge $chainTime) { Trigger-Chain | Out-Null; $chainTriggered = $true; break }
+            if (($now - $lastSaveTime).TotalMinutes -ge $saveInterval) { Save-Secrets; $lastSaveTime = $now }
+            if ($now -ge $hardLimitTime) { Save-Secrets; if (-not $chainTriggered) { Trigger-Chain | Out-Null }; break }
+            Start-Sleep -Seconds 60
+            $loopCount++
+          }
