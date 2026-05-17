@@ -482,13 +482,47 @@ jobs:
               $configObj = $config | ConvertFrom-Json
               $sanitizedKeys = @("remoteId", "remote_id")  # Known offenders
               $didSanitize = $false
+              $didNormalizeNvidia = $false
+              
+              function Copy-JsonValue {
+                param($Value)
+                if ($null -eq $Value) {
+                  return $null
+                }
+                return ($Value | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+              }
+              
+              function Get-NvidiaProviderName {
+                param([int]$Index)
+                $value = $Index
+                $suffix = ""
+                do {
+                  $suffix = ([char](97 + ($value % 26))) + $suffix
+                  $value = [math]::Floor($value / 26) - 1
+                } while ($value -ge 0)
+                return "nvidia-$suffix"
+              }
+              
+              function Get-TargetModelIdFromReference {
+                param(
+                  [string]$Reference,
+                  [string[]]$TargetModelIds
+                )
+                foreach ($targetModelId in $TargetModelIds) {
+                  if ($Reference -like "*/$targetModelId") {
+                    return $targetModelId
+                  }
+                }
+                return $null
+              }
               
               if ($configObj.models.providers) {
                 foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
                   $provider = $providerProp.Value
-                  if ($provider.models -and $provider.models -is [System.Array]) {
-                    for ($i = 0; $i -lt $provider.models.Count; $i++) {
-                      $model = $provider.models[$i]
+                  if ($provider.models) {
+                    $providerModels = @($provider.models)
+                    for ($i = 0; $i -lt $providerModels.Count; $i++) {
+                      $model = $providerModels[$i]
                       foreach ($badKey in $sanitizedKeys) {
                         if ($model.PSObject.Properties[$badKey]) {
                           Write-Host "  SANITIZE: Removing '$badKey' from $($providerProp.Name).models[$i]"
@@ -502,8 +536,224 @@ jobs:
               }
               
               if ($didSanitize) {
-                $config = $configObj | ConvertTo-Json -Depth 20
                 Write-Host "  Config sanitized (removed unrecognized keys)"
+              }
+              
+              if ($configObj.env -and $configObj.models -and $configObj.models.providers) {
+                $targetModelDefaults = [ordered]@{
+                  "moonshotai/kimi-k2.6" = [PSCustomObject][ordered]@{
+                    id = "moonshotai/kimi-k2.6"
+                    name = "Kimi K2.6 (NVIDIA NIM)"
+                    reasoning = $true
+                    input = @("text")
+                    cost = [PSCustomObject][ordered]@{
+                      input = 0
+                      output = 0
+                      cacheRead = 0
+                      cacheWrite = 0
+                    }
+                    contextWindow = 200000
+                    maxTokens = 16384
+                  }
+                  "deepseek-ai/deepseek-v4-flash" = [PSCustomObject][ordered]@{
+                    id = "deepseek-ai/deepseek-v4-flash"
+                    name = "DeepSeek V4 Flash (NVIDIA NIM)"
+                    reasoning = $true
+                    input = @("text")
+                    cost = [PSCustomObject][ordered]@{
+                      input = 0
+                      output = 0
+                      cacheRead = 0
+                      cacheWrite = 0
+                    }
+                    contextWindow = 200000
+                    maxTokens = 16384
+                  }
+                  "deepseek-ai/deepseek-v4-pro" = [PSCustomObject][ordered]@{
+                    id = "deepseek-ai/deepseek-v4-pro"
+                    name = "DeepSeek V4 Pro (NVIDIA NIM)"
+                    reasoning = $true
+                    input = @("text")
+                    cost = [PSCustomObject][ordered]@{
+                      input = 0
+                      output = 0
+                      cacheRead = 0
+                      cacheWrite = 0
+                    }
+                    contextWindow = 200000
+                    maxTokens = 8192
+                  }
+                }
+                $targetModelIds = @($targetModelDefaults.Keys)
+                $nvidiaEnvProps = @(
+                  $configObj.env.PSObject.Properties |
+                    Where-Object { $_.Name -match '^NVIDIA_API_KEY(?:_.+)?$' } |
+                    Sort-Object `
+                      @{ Expression = {
+                        if ($_.Name -eq 'NVIDIA_API_KEY') { return 1 }
+                        if ($_.Name -match '^NVIDIA_API_KEY_(\d+)$') { return [int]$Matches[1] }
+                        return [int]::MaxValue
+                      } }, `
+                      @{ Expression = { $_.Name } }
+                )
+                
+                if ($nvidiaEnvProps.Count -gt 0) {
+                  $targetModels = [ordered]@{}
+                  foreach ($targetModelId in $targetModelIds) {
+                    $targetModels[$targetModelId] = Copy-JsonValue $targetModelDefaults[$targetModelId]
+                  }
+                  
+                  foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
+                    $provider = $providerProp.Value
+                    if (-not $provider.models) {
+                      continue
+                    }
+                    foreach ($model in @($provider.models)) {
+                      $modelId = [string]$model.id
+                      if ($targetModels.Contains($modelId)) {
+                        $targetModels[$modelId] = Copy-JsonValue $model
+                      }
+                    }
+                  }
+                  
+                  $providerNames = @()
+                  $rebuiltProviders = [ordered]@{}
+                  for ($i = 0; $i -lt $nvidiaEnvProps.Count; $i++) {
+                    $providerName = Get-NvidiaProviderName $i
+                    $providerNames += $providerName
+                    $rebuiltProviders[$providerName] = [PSCustomObject][ordered]@{
+                      baseUrl = "https://integrate.api.nvidia.com/v1"
+                      apiKey = '${' + $nvidiaEnvProps[$i].Name + '}'
+                      api = "openai-completions"
+                      models = @(
+                        (Copy-JsonValue $targetModels["moonshotai/kimi-k2.6"]),
+                        (Copy-JsonValue $targetModels["deepseek-ai/deepseek-v4-flash"]),
+                        (Copy-JsonValue $targetModels["deepseek-ai/deepseek-v4-pro"])
+                      )
+                    }
+                  }
+                  
+                  $preservedProviders = [ordered]@{}
+                  foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
+                    $provider = $providerProp.Value
+                    $usesNvidiaKey = $false
+                    if ($provider.PSObject.Properties["apiKey"]) {
+                      $usesNvidiaKey = ([string]$provider.apiKey) -match '\$\{NVIDIA_API_KEY'
+                    }
+                    $usesNvidiaBaseUrl = ([string]$provider.baseUrl) -eq 'https://integrate.api.nvidia.com/v1'
+                    $containsTargetModel = $false
+                    if ($provider.models) {
+                      foreach ($model in @($provider.models)) {
+                        if ($targetModels.Contains([string]$model.id)) {
+                          $containsTargetModel = $true
+                          break
+                        }
+                      }
+                    }
+                    
+                    if (-not ($usesNvidiaKey -or $usesNvidiaBaseUrl -or $containsTargetModel)) {
+                      $preservedProviders[$providerProp.Name] = Copy-JsonValue $provider
+                    }
+                  }
+                  
+                  $mergedProviders = [ordered]@{}
+                  foreach ($providerProp in $preservedProviders.GetEnumerator()) {
+                    $mergedProviders[$providerProp.Key] = $providerProp.Value
+                  }
+                  foreach ($providerProp in $rebuiltProviders.GetEnumerator()) {
+                    $mergedProviders[$providerProp.Key] = $providerProp.Value
+                  }
+                  $configObj.models.providers = [PSCustomObject]$mergedProviders
+                  
+                  if (-not $configObj.agents) {
+                    $configObj | Add-Member -NotePropertyName "agents" -NotePropertyValue ([PSCustomObject]@{}) -Force
+                  }
+                  if (-not $configObj.agents.defaults) {
+                    $configObj.agents | Add-Member -NotePropertyName "defaults" -NotePropertyValue ([PSCustomObject]@{}) -Force
+                  }
+                  if (-not $configObj.agents.defaults.model) {
+                    $configObj.agents.defaults | Add-Member -NotePropertyName "model" -NotePropertyValue ([PSCustomObject]@{}) -Force
+                  }
+                  if (-not $configObj.agents.defaults.models) {
+                    $configObj.agents.defaults | Add-Member -NotePropertyName "models" -NotePropertyValue ([PSCustomObject]@{}) -Force
+                  }
+                  
+                  $targetModelSettings = @{}
+                  foreach ($targetModelId in $targetModelIds) {
+                    $existingSetting = $configObj.agents.defaults.models.PSObject.Properties |
+                      Where-Object { $_.Name -like "*/$targetModelId" } |
+                      Select-Object -First 1
+                    if ($existingSetting) {
+                      $targetModelSettings[$targetModelId] = Copy-JsonValue $existingSetting.Value
+                    } else {
+                      $targetModelSettings[$targetModelId] = [PSCustomObject]@{}
+                    }
+                  }
+                  
+                  $normalizedModelSettings = [ordered]@{}
+                  foreach ($modelProp in $configObj.agents.defaults.models.PSObject.Properties) {
+                    $isTargetModel = $null -ne (Get-TargetModelIdFromReference -Reference $modelProp.Name -TargetModelIds $targetModelIds)
+                    $isLegacyNvidiaModel = $modelProp.Name -like "nvidia-*/*"
+                    if (-not ($isTargetModel -or $isLegacyNvidiaModel)) {
+                      $normalizedModelSettings[$modelProp.Name] = Copy-JsonValue $modelProp.Value
+                    }
+                  }
+                  foreach ($providerName in $providerNames) {
+                    foreach ($targetModelId in $targetModelIds) {
+                      $normalizedModelSettings["$providerName/$targetModelId"] = Copy-JsonValue $targetModelSettings[$targetModelId]
+                    }
+                  }
+                  $configObj.agents.defaults.models = [PSCustomObject]$normalizedModelSettings
+                  
+                  $currentPrimary = [string]$configObj.agents.defaults.model.primary
+                  $currentFallbacks = @($configObj.agents.defaults.model.fallbacks)
+                  $primaryTargetModelId = Get-TargetModelIdFromReference -Reference $currentPrimary -TargetModelIds $targetModelIds
+                  if ([string]::IsNullOrWhiteSpace($primaryTargetModelId)) {
+                    $primaryTargetModelId = "deepseek-ai/deepseek-v4-flash"
+                  }
+                  $newPrimary = "$($providerNames[0])/$primaryTargetModelId"
+                  $seenFallbacks = New-Object 'System.Collections.Generic.HashSet[string]'
+                  $null = $seenFallbacks.Add($newPrimary)
+                  $newFallbacks = New-Object 'System.Collections.Generic.List[string]'
+                  
+                  foreach ($providerName in $providerNames) {
+                    $candidate = "$providerName/$primaryTargetModelId"
+                    if ($seenFallbacks.Add($candidate)) {
+                      $newFallbacks.Add($candidate)
+                    }
+                  }
+                  
+                  foreach ($fallback in $currentFallbacks) {
+                    $fallbackRef = [string]$fallback
+                    if ([string]::IsNullOrWhiteSpace($fallbackRef)) {
+                      continue
+                    }
+                    
+                    $targetModelId = Get-TargetModelIdFromReference -Reference $fallbackRef -TargetModelIds $targetModelIds
+                    if ($targetModelId) {
+                      foreach ($providerName in $providerNames) {
+                        $candidate = "$providerName/$targetModelId"
+                        if ($seenFallbacks.Add($candidate)) {
+                          $newFallbacks.Add($candidate)
+                        }
+                      }
+                      continue
+                    }
+                    
+                    if ($fallbackRef -like "nvidia-*/*") {
+                      continue
+                    }
+                    
+                    if ($seenFallbacks.Add($fallbackRef)) {
+                      $newFallbacks.Add($fallbackRef)
+                    }
+                  }
+                  
+                  $configObj.agents.defaults.model.primary = $newPrimary
+                  $configObj.agents.defaults.model.fallbacks = @($newFallbacks)
+                  $didNormalizeNvidia = $true
+                  Write-Host "  Normalized NVIDIA providers to deterministic per-key layout ($($providerNames.Count) providers)"
+                }
               }
               
               # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
@@ -514,17 +764,19 @@ jobs:
                   Write-Host "  Adding 'browser' to plugins.allow list"
                   $allowList += "browser"
                   $configObj.plugins.allow = $allowList
-                  $config = $configObj | ConvertTo-Json -Depth 20
                 }
               }
               
               # Ensure browser.enabled is true
               if (-not $configObj.browser) {
-                $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
+                $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue ([PSCustomObject]@{}) -Force
               }
               if ($configObj.browser.enabled -eq $false) {
                 Write-Host "  Enabling browser in config"
                 $configObj.browser.enabled = $true
+              }
+              
+              if ($didSanitize -or $didNormalizeNvidia -or $configObj.plugins -or $configObj.browser) {
                 $config = $configObj | ConvertTo-Json -Depth 20
               }
             } catch {
