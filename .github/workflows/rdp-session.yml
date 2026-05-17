@@ -15,6 +15,10 @@ on:
         description: 'Bump to force openclaw upgrade (e.g. v1 -> v2)'
         required: false
         default: 'v1'
+      openclaw_config_url:
+        description: 'Raw URL to openclaw.json config (e.g. pastebin/raw gist link)'
+        required: false
+        default: ''
   repository_dispatch:
     types: [chain-rdp]
 
@@ -49,6 +53,7 @@ jobs:
           
           # Resolve openclaw cache version (from input or chained payload)
           $openclawCacheVersion = "${{ github.event.inputs.openclaw_cache_version }}"
+          $openclawConfigUrl = "${{ github.event.inputs.openclaw_config_url }}"
           
           if ("${{ github.event_name }}" -eq "repository_dispatch") {
             $payloadCount = "${{ github.event.client_payload.chain_count }}"
@@ -58,6 +63,10 @@ jobs:
             $payloadCacheVersion = "${{ github.event.client_payload.openclaw_cache_version }}"
             if (-not [string]::IsNullOrEmpty($payloadCacheVersion)) {
               $openclawCacheVersion = $payloadCacheVersion
+            }
+            $payloadConfigUrl = "${{ github.event.client_payload.openclaw_config_url }}"
+            if (-not [string]::IsNullOrEmpty($payloadConfigUrl)) {
+              $openclawConfigUrl = $payloadConfigUrl
             }
           }
           
@@ -71,6 +80,7 @@ jobs:
           echo "SESSION_ID=$sessionId" >> $env:GITHUB_OUTPUT
           echo "CHAIN_COUNT=$chainCount" >> $env:GITHUB_OUTPUT
           echo "OPENCLAW_CACHE_VERSION=$openclawCacheVersion" >> $env:GITHUB_OUTPUT
+          echo "OPENCLAW_CONFIG_URL=$openclawConfigUrl" >> $env:GITHUB_OUTPUT
           echo "JOB_START_TICKS=$jobStartTicks" >> $env:GITHUB_OUTPUT
           
           Write-Host "Session: $sessionId | Chain: $chainCount | Cache: $openclawCacheVersion"
@@ -463,80 +473,93 @@ jobs:
       - name: Configure OpenClaw
         shell: pwsh
         env:
-          OPENCLAW_CONFIG: ${{ secrets.OPENCLAW_CONFIG }}
+          OPENCLAW_CONFIG_URL: ${{ steps.session.outputs.OPENCLAW_CONFIG_URL }}
           OPENCLAW_AUTH_PROFILES: ${{ secrets.OPENCLAW_AUTH_PROFILES }}
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $openclawDir = "$rdpUserHome\.openclaw"
           
-          # Inject openclaw.json from secret
-          if ($env:OPENCLAW_CONFIG) {
-            # Fix paths: replace any user home path with rdpuser path
-            $config = $env:OPENCLAW_CONFIG
-            $config = $config -replace 'C:\\\\Users\\\\[^\\\"]+', ($rdpUserHome -replace '\\', '\\\\')
-            $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
+          if (-not $env:OPENCLAW_CONFIG_URL) {
+            Write-Host "ERROR: Missing openclaw_config_url input/client_payload value"
+            exit 1
+          }
+
+          # Download openclaw.json from external URL
+          try {
+            $downloadResp = Invoke-WebRequest -Uri $env:OPENCLAW_CONFIG_URL -UseBasicParsing -ErrorAction Stop
+            $config = $downloadResp.Content
+          } catch {
+            Write-Host "ERROR: Failed to download OpenClaw config from URL: $env:OPENCLAW_CONFIG_URL"
+            Write-Host "ERROR: $_"
+            exit 1
+          }
+
+          if ([string]::IsNullOrWhiteSpace($config)) {
+            Write-Host "ERROR: Downloaded OpenClaw config is empty"
+            exit 1
+          }
+
+          # Fix paths: replace any user home path with rdpuser path
+          $config = $config -replace 'C:\\\\Users\\\\[^\\\"]+', ($rdpUserHome -replace '\\', '\\\\')
+          $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
             
-            # Sanitize: remove unrecognized keys from model entries that crash OpenClaw
-            # (e.g. "remoteId" added by OpenClaw runtime but rejected on startup)
-            try {
-              $configObj = $config | ConvertFrom-Json
-              $sanitizedKeys = @("remoteId", "remote_id")  # Known offenders
-              $didSanitize = $false
+          # Sanitize: remove unrecognized keys from model entries that crash OpenClaw
+          # (e.g. "remoteId" added by OpenClaw runtime but rejected on startup)
+          try {
+            $configObj = $config | ConvertFrom-Json
+            $sanitizedKeys = @("remoteId", "remote_id")  # Known offenders
+            $didSanitize = $false
               
-              if ($configObj.models.providers) {
-                foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
-                  $provider = $providerProp.Value
-                  if ($provider.models -and $provider.models -is [System.Array]) {
-                    for ($i = 0; $i -lt $provider.models.Count; $i++) {
-                      $model = $provider.models[$i]
-                      foreach ($badKey in $sanitizedKeys) {
-                        if ($model.PSObject.Properties[$badKey]) {
-                          Write-Host "  SANITIZE: Removing '$badKey' from $($providerProp.Name).models[$i]"
-                          $model.PSObject.Properties.Remove($badKey)
-                          $didSanitize = $true
-                        }
+            if ($configObj.models.providers) {
+              foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
+                $provider = $providerProp.Value
+                if ($provider.models -and $provider.models -is [System.Array]) {
+                  for ($i = 0; $i -lt $provider.models.Count; $i++) {
+                    $model = $provider.models[$i]
+                    foreach ($badKey in $sanitizedKeys) {
+                      if ($model.PSObject.Properties[$badKey]) {
+                        Write-Host "  SANITIZE: Removing '$badKey' from $($providerProp.Name).models[$i]"
+                        $model.PSObject.Properties.Remove($badKey)
+                        $didSanitize = $true
                       }
                     }
                   }
                 }
               }
-              
-              if ($didSanitize) {
-                $config = $configObj | ConvertTo-Json -Depth 20
-                Write-Host "  Config sanitized (removed unrecognized keys)"
-              }
-              
-              # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
-              # If plugins.allow exists, 'browser' must be in the list
-              if ($configObj.plugins -and $configObj.plugins.allow) {
-                $allowList = @($configObj.plugins.allow)
-                if ($allowList -notcontains "browser") {
-                  Write-Host "  Adding 'browser' to plugins.allow list"
-                  $allowList += "browser"
-                  $configObj.plugins.allow = $allowList
-                  $config = $configObj | ConvertTo-Json -Depth 20
-                }
-              }
-              
-              # Ensure browser.enabled is true
-              if (-not $configObj.browser) {
-                $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
-              }
-              if ($configObj.browser.enabled -eq $false) {
-                Write-Host "  Enabling browser in config"
-                $configObj.browser.enabled = $true
-                $config = $configObj | ConvertTo-Json -Depth 20
-              }
-            } catch {
-              Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
             }
-            
-            $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
-            Write-Host "Injected openclaw.json from secret (paths fixed to $rdpUserHome)"
-          } else {
-            Write-Host "ERROR: No OPENCLAW_CONFIG secret found"
-            exit 1
+              
+            if ($didSanitize) {
+              $config = $configObj | ConvertTo-Json -Depth 20
+              Write-Host "  Config sanitized (removed unrecognized keys)"
+            }
+              
+            # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
+            # If plugins.allow exists, 'browser' must be in the list
+            if ($configObj.plugins -and $configObj.plugins.allow) {
+              $allowList = @($configObj.plugins.allow)
+              if ($allowList -notcontains "browser") {
+                Write-Host "  Adding 'browser' to plugins.allow list"
+                $allowList += "browser"
+                $configObj.plugins.allow = $allowList
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
+            }
+              
+            # Ensure browser.enabled is true
+            if (-not $configObj.browser) {
+              $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
+            }
+            if ($configObj.browser.enabled -eq $false) {
+              Write-Host "  Enabling browser in config"
+              $configObj.browser.enabled = $true
+              $config = $configObj | ConvertTo-Json -Depth 20
+            }
+          } catch {
+            Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
           }
+          
+          $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
+          Write-Host "Injected openclaw.json from URL (paths fixed to $rdpUserHome)"
           
           # Inject auth-profiles.json from secret
           if ($env:OPENCLAW_AUTH_PROFILES) {
