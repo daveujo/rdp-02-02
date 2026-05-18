@@ -563,8 +563,8 @@ jobs:
           $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
           $configPath = "$rdpUserHome\.openclaw\openclaw.json"
 
-          Write-Host "Running: openclaw doctor --fix"
-          $doctorOutput = openclaw doctor --fix 2>&1 | Out-String
+          Write-Host "Running: openclaw doctor --yes"
+          $doctorOutput = openclaw doctor --yes 2>&1 | Out-String
           Write-Host $doctorOutput
 
           if ($LASTEXITCODE -ne 0) {
