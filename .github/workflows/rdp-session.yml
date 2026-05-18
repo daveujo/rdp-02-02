@@ -23,7 +23,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -479,6 +479,13 @@ jobs:
             if ($configObj.browser.enabled -eq $false) {
               Write-Host "  Enabling browser in config"
               $configObj.browser.enabled = $true
+              $config = $configObj | ConvertTo-Json -Depth 20
+            }
+
+            # Remove stale browser plugin references when using direct CloakBrowser.
+            if ($configObj.plugins -and $configObj.plugins.entries -and $configObj.plugins.entries.browser) {
+              Write-Host "  Removing stale plugins.entries.browser reference"
+              $configObj.plugins.entries.PSObject.Properties.Remove("browser")
               $config = $configObj | ConvertTo-Json -Depth 20
             }
 
