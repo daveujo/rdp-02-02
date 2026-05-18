@@ -23,7 +23,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -582,24 +582,24 @@ jobs:
           $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
           $configPath = "$rdpUserHome\.openclaw\openclaw.json"
 
-          Write-Host "Running: openclaw doctor --repair --force"
-          $doctorOutput = openclaw doctor --repair --force 2>&1 | Out-String
+          Write-Host "Running: openclaw doctor --non-interactive"
+          $doctorOutput = openclaw doctor --non-interactive 2>&1 | Out-String
           Write-Host $doctorOutput
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARNING: openclaw doctor --fix exited with code $LASTEXITCODE"
+            Write-Host "WARNING: openclaw doctor --non-interactive exited with code $LASTEXITCODE"
             $global:LASTEXITCODE = 0
           }
 
           if (Test-Path $configPath) {
             try {
               Get-Content $configPath -Raw | ConvertFrom-Json | Out-Null
-              Write-Host "openclaw.json is valid JSON after doctor --fix"
+              Write-Host "openclaw.json is valid JSON after doctor --non-interactive"
             } catch {
-              Write-Host "WARNING: openclaw.json is invalid after doctor --fix: $_"
+              Write-Host "WARNING: openclaw.json is invalid after doctor --non-interactive: $_"
             }
           } else {
-            Write-Host "WARNING: openclaw.json not found after doctor --fix: $configPath"
+            Write-Host "WARNING: openclaw.json not found after doctor --non-interactive: $configPath"
           }
 
       # ========== BROWSER SETUP ==========
