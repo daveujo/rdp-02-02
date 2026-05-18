@@ -542,31 +542,6 @@ jobs:
               $configObj.browser.enabled = $true
               $config = $configObj | ConvertTo-Json -Depth 20
             }
-
-            # Remove stale browser plugin references when present.
-            if ($configObj.plugins -and $configObj.plugins.entries -and $configObj.plugins.entries.browser) {
-              Write-Host "  Removing stale plugins.entries.browser reference"
-              $configObj.plugins.entries.PSObject.Properties.Remove("browser")
-              $config = $configObj | ConvertTo-Json -Depth 20
-            }
-
-            # Normalize legacy Telegram streaming config to the boolean schema OpenClaw expects.
-            if ($configObj.channels -and $configObj.channels.telegram) {
-              $telegram = $configObj.channels.telegram
-              if ($null -ne $telegram.streaming -and $telegram.streaming -isnot [bool]) {
-                $newStreaming = $true
-                if ($telegram.streaming.PSObject.Properties.Name -contains "enabled") {
-                  $newStreaming = [bool]$telegram.streaming.enabled
-                } elseif ($telegram.streaming.PSObject.Properties.Name -contains "value") {
-                  $newStreaming = [bool]$telegram.streaming.value
-                }
-
-                Write-Host "  Normalizing channels.telegram.streaming to boolean: $newStreaming"
-                $telegram.streaming = $newStreaming
-                $configObj.channels.telegram = $telegram
-                $config = $configObj | ConvertTo-Json -Depth 20
-              }
-            }
           } catch {
             Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
           }
@@ -577,17 +552,35 @@ jobs:
           $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
-          
-      # ========== PATCH OPENCLAW ==========
-      - name: Patch OpenClaw (Antigravity models + endpoints)
+
+      - name: Run OpenClaw doctor fix
         shell: pwsh
+        continue-on-error: true
         run: |
-          $patchScript = Join-Path $env:GITHUB_WORKSPACE "patch-windows.ps1"
-          if (Test-Path $patchScript) {
-            Write-Host "Running OpenClaw patch script..."
-            & $patchScript
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
+          $configPath = "$rdpUserHome\.openclaw\openclaw.json"
+
+          Write-Host "Running: openclaw doctor --fix"
+          $doctorOutput = openclaw doctor --fix 2>&1 | Out-String
+          Write-Host $doctorOutput
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "WARNING: openclaw doctor --fix exited with code $LASTEXITCODE"
+            $global:LASTEXITCODE = 0
+          }
+
+          if (Test-Path $configPath) {
+            try {
+              Get-Content $configPath -Raw | ConvertFrom-Json | Out-Null
+              Write-Host "openclaw.json is valid JSON after doctor --fix"
+            } catch {
+              Write-Host "WARNING: openclaw.json is invalid after doctor --fix: $_"
+            }
           } else {
-            Write-Host "WARNING: patch-windows.ps1 not found in repo root -- skipping patching"
+            Write-Host "WARNING: openclaw.json not found after doctor --fix: $configPath"
           }
 
       # ========== BROWSER SETUP ==========
