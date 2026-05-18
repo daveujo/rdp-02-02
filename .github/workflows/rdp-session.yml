@@ -552,6 +552,36 @@ jobs:
           $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
+
+      - name: Run OpenClaw doctor fix
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
+          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
+          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
+          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
+          $configPath = "$rdpUserHome\.openclaw\openclaw.json"
+
+          Write-Host "Running: openclaw doctor --fix"
+          $doctorOutput = openclaw doctor --fix 2>&1 | Out-String
+          Write-Host $doctorOutput
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "WARNING: openclaw doctor --fix exited with code $LASTEXITCODE"
+            $global:LASTEXITCODE = 0
+          }
+
+          if (Test-Path $configPath) {
+            try {
+              Get-Content $configPath -Raw | ConvertFrom-Json | Out-Null
+              Write-Host "openclaw.json is valid JSON after doctor --fix"
+            } catch {
+              Write-Host "WARNING: openclaw.json is invalid after doctor --fix: $_"
+            }
+          } else {
+            Write-Host "WARNING: openclaw.json not found after doctor --fix: $configPath"
+          }
           
       # ========== PATCH OPENCLAW ==========
       - name: Patch OpenClaw (Antigravity models + endpoints)
