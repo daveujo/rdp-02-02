@@ -23,7 +23,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -541,6 +541,25 @@ jobs:
               Write-Host "  Enabling browser in config"
               $configObj.browser.enabled = $true
               $config = $configObj | ConvertTo-Json -Depth 20
+            }
+
+            # Normalize legacy Telegram streaming config to the boolean schema OpenClaw expects.
+            # Some older configs store `channels.telegram.streaming` as an object.
+            if ($configObj.channels -and $configObj.channels.telegram) {
+              $telegram = $configObj.channels.telegram
+              if ($null -ne $telegram.streaming -and $telegram.streaming -isnot [bool]) {
+                $newStreaming = $true
+                if ($telegram.streaming.PSObject.Properties.Name -contains "enabled") {
+                  $newStreaming = [bool]$telegram.streaming.enabled
+                } elseif ($telegram.streaming.PSObject.Properties.Name -contains "value") {
+                  $newStreaming = [bool]$telegram.streaming.value
+                }
+
+                Write-Host "  Normalizing channels.telegram.streaming to boolean: $newStreaming"
+                $telegram.streaming = $newStreaming
+                $configObj.channels.telegram = $telegram
+                $config = $configObj | ConvertTo-Json -Depth 20
+              }
             }
           } catch {
             Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
