@@ -23,7 +23,7 @@ env:
 
 jobs:
   rdp-session:
-    
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
@@ -563,8 +563,8 @@ jobs:
           $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
           $configPath = "$rdpUserHome\.openclaw\openclaw.json"
 
-          Write-Host "Running: openclaw doctor --yes"
-          $doctorOutput = openclaw doctor --yes 2>&1 | Out-String
+          Write-Host "Running: openclaw doctor --repair"
+          $doctorOutput = openclaw doctor --repair 2>&1 | Out-String
           Write-Host $doctorOutput
 
           if ($LASTEXITCODE -ne 0) {
