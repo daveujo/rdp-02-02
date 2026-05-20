@@ -20,7 +20,7 @@ on:
 
 env:
   CHAIN_TRIGGER_MINUTES: 335   # Fire chain dispatch at this many minutes from job start
-  SAVE_INTERVAL_MINUTES: 60    # Periodic secret saves during keepalive
+  SAVE_INTERVAL_MINUTES: 60    # Periodic config saves during keepalive
 
 jobs:
   rdp-session:
@@ -463,16 +463,29 @@ jobs:
       - name: Configure OpenClaw
         shell: pwsh
         env:
-          OPENCLAW_CONFIG: ${{ secrets.OPENCLAW_CONFIG }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
           OPENCLAW_AUTH_PROFILES: ${{ secrets.OPENCLAW_AUTH_PROFILES }}
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $openclawDir = "$rdpUserHome\.openclaw"
+          $configRepo = "daveujo/openclawjson0202"
+          $configPath = "openclaw.json"
           
-          # Inject openclaw.json from secret
-          if ($env:OPENCLAW_CONFIG) {
+          # Load openclaw.json from private config repository
+          try {
+            $configMeta = gh api "repos/$configRepo/contents/$configPath" | ConvertFrom-Json
+            if (-not $configMeta.content) {
+              throw "Downloaded file content is empty"
+            }
+            $configBase64 = ($configMeta.content -replace "`n", "")
+            $config = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($configBase64))
+          } catch {
+            Write-Host "ERROR: Failed to load $configRepo/$configPath: $_"
+            exit 1
+          }
+
+          if ($config) {
             # Fix paths: replace any user home path with rdpuser path
-            $config = $env:OPENCLAW_CONFIG
             $config = $config -replace 'C:\\\\Users\\\\[^\\\"]+', ($rdpUserHome -replace '\\', '\\\\')
             $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
             
@@ -532,9 +545,9 @@ jobs:
             }
             
             $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
-            Write-Host "Injected openclaw.json from secret (paths fixed to $rdpUserHome)"
+            Write-Host "Loaded openclaw.json from $configRepo/$configPath (paths fixed to $rdpUserHome)"
           } else {
-            Write-Host "ERROR: No OPENCLAW_CONFIG secret found"
+            Write-Host "ERROR: Failed to load openclaw.json content"
             exit 1
           }
           
@@ -932,6 +945,8 @@ jobs:
           $saveInterval = ${{ env.SAVE_INTERVAL_MINUTES }}
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
+          $configRepo = "daveujo/openclawjson0202"
+          $configPath = "openclaw.json"
           $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
           $chainCount = [int]"${{ steps.session.outputs.CHAIN_COUNT }}"
           $openclawCacheVersion = "${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
@@ -960,20 +975,38 @@ jobs:
           # to prevent PowerShell memory accumulation over 5+ hour sessions
           $gcInterval = 30
           
-          # Helper: save secrets to GitHub
+          # Helper: update openclaw.json in private config repo using current file SHA
+          function Save-OpenClawConfig {
+            param([string]$configFilePath)
+            if (-not (Test-Path $configFilePath)) {
+              return
+            }
+            $configRaw = Get-Content $configFilePath -Raw
+            $configBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($configRaw))
+            $configMeta = gh api "repos/$configRepo/contents/$configPath" | ConvertFrom-Json
+            if (-not $configMeta.sha) {
+              throw "Missing SHA for $configRepo/$configPath"
+            }
+            $payload = @{
+              message = "Update openclaw.json from $repo run $env:GITHUB_RUN_ID"
+              content = $configBase64
+              sha     = $configMeta.sha
+            } | ConvertTo-Json -Compress
+            $payload | gh api "repos/$configRepo/contents/$configPath" --method PUT --input - 2>&1 | Out-Null
+          }
+
+          # Helper: save config/secrets
           function Save-Secrets {
             $configFile = "$rdpUserHome\.openclaw\openclaw.json"
             $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
             try {
-              if (Test-Path $configFile) {
-                Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo 2>&1 | Out-Null
-              }
+              Save-OpenClawConfig -configFilePath $configFile
               if (Test-Path $authFile) {
                 Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo 2>&1 | Out-Null
               }
-              Write-Host "  [SAVE] Secrets saved at $(Get-Date -Format 'HH:mm:ss')"
+              Write-Host "  [SAVE] Config/auth saved at $(Get-Date -Format 'HH:mm:ss')"
             } catch {
-              Write-Host "  [SAVE] WARNING: Secret save failed: $_"
+              Write-Host "  [SAVE] WARNING: Config/auth save failed: $_"
             }
           }
           
@@ -1212,7 +1245,7 @@ jobs:
           }
           
           # Final save before exiting
-          Write-Host "Hard limit reached - final secret save"
+          Write-Host "Hard limit reached - final config/auth save"
           Save-Secrets
           if (-not $chainTriggered) {
             echo "CHAIN_DONE=false" >> $env:GITHUB_OUTPUT
@@ -1226,20 +1259,39 @@ jobs:
         run: |
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
+          $configRepo = "daveujo/openclawjson0202"
+          $configPath = "openclaw.json"
           $configFile = "$rdpUserHome\.openclaw\openclaw.json"
           $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
           
-          Write-Host "Fallback secret save (in case keepalive was interrupted)..."
-          try {
-            if (Test-Path $configFile) {
-              Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo
+          function Save-OpenClawConfig {
+            param([string]$configFilePath)
+            if (-not (Test-Path $configFilePath)) {
+              return
             }
+            $configRaw = Get-Content $configFilePath -Raw
+            $configBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($configRaw))
+            $configMeta = gh api "repos/$configRepo/contents/$configPath" | ConvertFrom-Json
+            if (-not $configMeta.sha) {
+              throw "Missing SHA for $configRepo/$configPath"
+            }
+            $payload = @{
+              message = "Final openclaw.json save from $repo run $env:GITHUB_RUN_ID"
+              content = $configBase64
+              sha     = $configMeta.sha
+            } | ConvertTo-Json -Compress
+            $payload | gh api "repos/$configRepo/contents/$configPath" --method PUT --input - 2>&1 | Out-Null
+          }
+
+          Write-Host "Fallback config/auth save (in case keepalive was interrupted)..."
+          try {
+            Save-OpenClawConfig -configFilePath $configFile
             if (Test-Path $authFile) {
               Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo
             }
-            Write-Host "Secrets saved"
+            Write-Host "Config/auth saved"
           } catch {
-            Write-Host "WARNING: Secret save failed: $_"
+            Write-Host "WARNING: Config/auth save failed: $_"
           }
         continue-on-error: true
 
