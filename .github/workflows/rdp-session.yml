@@ -20,10 +20,11 @@ on:
 
 env:
   CHAIN_TRIGGER_MINUTES: 335   # Fire chain dispatch at this many minutes from job start
+  SAVE_INTERVAL_MINUTES: 60    # Periodic secret saves during keepalive
 
 jobs:
   rdp-session:
-    runs-on: windows-latest
+    
     timeout-minutes: 360
 
     steps:
@@ -462,125 +463,103 @@ jobs:
       - name: Configure OpenClaw
         shell: pwsh
         env:
-          OPENCLAW_CONFIG_URL: ${{ secrets.OPENCLAW_CONFIG }}
+          OPENCLAW_CONFIG: ${{ secrets.OPENCLAW_CONFIG }}
+          OPENCLAW_AUTH_PROFILES: ${{ secrets.OPENCLAW_AUTH_PROFILES }}
         run: |
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $openclawDir = "$rdpUserHome\.openclaw"
           
-          if (-not $env:OPENCLAW_CONFIG_URL) {
-            Write-Host "ERROR: Missing OPENCLAW_CONFIG secret (expected raw config URL)"
-            exit 1
-          }
-
-          # Download openclaw.json from external URL
-          try {
-            $downloadResp = Invoke-WebRequest -Uri $env:OPENCLAW_CONFIG_URL -UseBasicParsing -ErrorAction Stop
-            $config = $downloadResp.Content
-          } catch {
-            Write-Host "ERROR: Failed to download OpenClaw config from URL: $env:OPENCLAW_CONFIG_URL"
-            Write-Host "ERROR: $_"
-            exit 1
-          }
-
-          if ([string]::IsNullOrWhiteSpace($config)) {
-            Write-Host "ERROR: Downloaded OpenClaw config is empty"
-            exit 1
-          }
-
-          # Fix paths: replace any user home path with rdpuser path
-          $config = $config -replace 'C:\\\\Users\\\\[^\\\"]+', ($rdpUserHome -replace '\\', '\\\\')
-          $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
+          # Inject openclaw.json from secret
+          if ($env:OPENCLAW_CONFIG) {
+            # Fix paths: replace any user home path with rdpuser path
+            $config = $env:OPENCLAW_CONFIG
+            $config = $config -replace 'C:\\\\Users\\\\[^\\\"]+', ($rdpUserHome -replace '\\', '\\\\')
+            $config = $config -replace 'C:/Users/[^/\"]+', ($rdpUserHome -replace '\\', '/')
             
-          # Sanitize: remove unrecognized keys from model entries that crash OpenClaw
-          # (e.g. "remoteId" added by OpenClaw runtime but rejected on startup)
-          try {
-            $configObj = $config | ConvertFrom-Json
-            $sanitizedKeys = @("remoteId", "remote_id")  # Known offenders
-            $didSanitize = $false
+            # Sanitize: remove unrecognized keys from model entries that crash OpenClaw
+            # (e.g. "remoteId" added by OpenClaw runtime but rejected on startup)
+            try {
+              $configObj = $config | ConvertFrom-Json
+              $sanitizedKeys = @("remoteId", "remote_id")  # Known offenders
+              $didSanitize = $false
               
-            if ($configObj.models.providers) {
-              foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
-                $provider = $providerProp.Value
-                if ($provider.models -and $provider.models -is [System.Array]) {
-                  for ($i = 0; $i -lt $provider.models.Count; $i++) {
-                    $model = $provider.models[$i]
-                    foreach ($badKey in $sanitizedKeys) {
-                      if ($model.PSObject.Properties[$badKey]) {
-                        Write-Host "  SANITIZE: Removing '$badKey' from $($providerProp.Name).models[$i]"
-                        $model.PSObject.Properties.Remove($badKey)
-                        $didSanitize = $true
+              if ($configObj.models.providers) {
+                foreach ($providerProp in $configObj.models.providers.PSObject.Properties) {
+                  $provider = $providerProp.Value
+                  if ($provider.models -and $provider.models -is [System.Array]) {
+                    for ($i = 0; $i -lt $provider.models.Count; $i++) {
+                      $model = $provider.models[$i]
+                      foreach ($badKey in $sanitizedKeys) {
+                        if ($model.PSObject.Properties[$badKey]) {
+                          Write-Host "  SANITIZE: Removing '$badKey' from $($providerProp.Name).models[$i]"
+                          $model.PSObject.Properties.Remove($badKey)
+                          $didSanitize = $true
+                        }
                       }
                     }
                   }
                 }
               }
-            }
               
-            if ($didSanitize) {
-              $config = $configObj | ConvertTo-Json -Depth 20
-              Write-Host "  Config sanitized (removed unrecognized keys)"
-            }
+              if ($didSanitize) {
+                $config = $configObj | ConvertTo-Json -Depth 20
+                Write-Host "  Config sanitized (removed unrecognized keys)"
+              }
               
-            # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
-            # If plugins.allow exists, 'browser' must be in the list
-            if ($configObj.plugins -and $configObj.plugins.allow) {
-              $allowList = @($configObj.plugins.allow)
-              if ($allowList -notcontains "browser") {
-                Write-Host "  Adding 'browser' to plugins.allow list"
-                $allowList += "browser"
-                $configObj.plugins.allow = $allowList
+              # Ensure browser plugin is enabled (required for 'openclaw browser' CLI)
+              # If plugins.allow exists, 'browser' must be in the list
+              if ($configObj.plugins -and $configObj.plugins.allow) {
+                $allowList = @($configObj.plugins.allow)
+                if ($allowList -notcontains "browser") {
+                  Write-Host "  Adding 'browser' to plugins.allow list"
+                  $allowList += "browser"
+                  $configObj.plugins.allow = $allowList
+                  $config = $configObj | ConvertTo-Json -Depth 20
+                }
+              }
+              
+              # Ensure browser.enabled is true
+              if (-not $configObj.browser) {
+                $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
+              }
+              if ($configObj.browser.enabled -eq $false) {
+                Write-Host "  Enabling browser in config"
+                $configObj.browser.enabled = $true
                 $config = $configObj | ConvertTo-Json -Depth 20
               }
+            } catch {
+              Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
             }
-              
-            # Ensure browser.enabled is true
-            if (-not $configObj.browser) {
-              $configObj | Add-Member -NotePropertyName "browser" -NotePropertyValue @{} -Force
-            }
-            if ($configObj.browser.enabled -eq $false) {
-              Write-Host "  Enabling browser in config"
-              $configObj.browser.enabled = $true
-              $config = $configObj | ConvertTo-Json -Depth 20
-            }
-          } catch {
-            Write-Host "  WARNING: Config sanitization failed (will write as-is): $_"
+            
+            $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
+            Write-Host "Injected openclaw.json from secret (paths fixed to $rdpUserHome)"
+          } else {
+            Write-Host "ERROR: No OPENCLAW_CONFIG secret found"
+            exit 1
           }
           
-          $config | Out-File -FilePath "$openclawDir\openclaw.json" -Encoding UTF8
-          Write-Host "Injected openclaw.json from URL (paths fixed to $rdpUserHome)"
+          # Inject auth-profiles.json from secret
+          if ($env:OPENCLAW_AUTH_PROFILES) {
+            $env:OPENCLAW_AUTH_PROFILES | Out-File -FilePath "$openclawDir\agents\main\agent\auth-profiles.json" -Encoding UTF8
+            Write-Host "Injected auth-profiles.json from secret"
+          } else {
+            Write-Host "WARNING: No OPENCLAW_AUTH_PROFILES secret found"
+          }
           
           $null = cmd /c "icacls `"$openclawDir`" /grant rdpuser:(OI)(CI)F /T /Q 2>&1"
           $global:LASTEXITCODE = 0
           Write-Host "OpenClaw configured"
-
-      - name: Run OpenClaw doctor fix
+          
+      # ========== PATCH OPENCLAW ==========
+      - name: Patch OpenClaw (Antigravity models + endpoints)
         shell: pwsh
-        continue-on-error: true
         run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
-          $configPath = "$rdpUserHome\.openclaw\openclaw.json"
-
-          Write-Host "Running: openclaw doctor --fix"
-          $doctorOutput = openclaw doctor --fix 2>&1 | Out-String
-          Write-Host $doctorOutput
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARNING: openclaw doctor --fix exited with code $LASTEXITCODE"
-            $global:LASTEXITCODE = 0
-          }
-
-          if (Test-Path $configPath) {
-            try {
-              Get-Content $configPath -Raw | ConvertFrom-Json | Out-Null
-              Write-Host "openclaw.json is valid JSON after doctor --fix"
-            } catch {
-              Write-Host "WARNING: openclaw.json is invalid after doctor --fix: $_"
-            }
+          $patchScript = Join-Path $env:GITHUB_WORKSPACE "patch-windows.ps1"
+          if (Test-Path $patchScript) {
+            Write-Host "Running OpenClaw patch script..."
+            & $patchScript
           } else {
-            Write-Host "WARNING: openclaw.json not found after doctor --fix: $configPath"
+            Write-Host "WARNING: patch-windows.ps1 not found in repo root -- skipping patching"
           }
 
       # ========== BROWSER SETUP ==========
@@ -882,36 +861,6 @@ jobs:
           }
         continue-on-error: true
 
-      - name: Run OpenClaw doctor fix
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
-          $env:NPM_CONFIG_PREFIX = "$rdpUserHome\.npm-global"
-          $env:PATH = "$rdpUserHome\.npm-global;$env:PATH"
-          $env:OPENCLAW_STATE_DIR = "$rdpUserHome\.openclaw"
-          $configPath = "$rdpUserHome\.openclaw\openclaw.json"
-
-          Write-Host "Running: openclaw doctor --fix"
-          $doctorOutput = openclaw doctor --fix 2>&1 | Out-String
-          Write-Host $doctorOutput
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "WARNING: openclaw doctor --fix exited with code $LASTEXITCODE"
-            $global:LASTEXITCODE = 0
-          }
-
-          if (Test-Path $configPath) {
-            try {
-              Get-Content $configPath -Raw | ConvertFrom-Json | Out-Null
-              Write-Host "openclaw.json is valid JSON after doctor --fix"
-            } catch {
-              Write-Host "WARNING: openclaw.json is invalid after doctor --fix: $_"
-            }
-          } else {
-            Write-Host "WARNING: openclaw.json not found after doctor --fix: $configPath"
-          }
-
       - name: Display Connection Info
         shell: pwsh
         run: |
@@ -980,6 +929,7 @@ jobs:
           $jobStart = [DateTime]::new([long]"${{ steps.session.outputs.JOB_START_TICKS }}")
           $chainTime = $jobStart.AddMinutes(${{ env.CHAIN_TRIGGER_MINUTES }})
           $hardLimitTime = $jobStart.AddMinutes(350)  # Stop 10 min before GitHub 360 limit, leaving room for fallback steps
+          $saveInterval = ${{ env.SAVE_INTERVAL_MINUTES }}
           $rdpUserHome = "C:\Users\rdpuser"
           $repo = "${{ github.repository }}"
           $sessionId = "${{ steps.session.outputs.SESSION_ID }}"
@@ -995,6 +945,7 @@ jobs:
           Write-Host "  Chain trigger at:  $($chainTime.ToString('HH:mm:ss')) (${{ env.CHAIN_TRIGGER_MINUTES }} min from job start)"
           Write-Host "  Hard limit at:     $($hardLimitTime.ToString('HH:mm:ss')) (350 min from job start)"
           Write-Host "  Remaining:         $remainingMinutes min"
+          Write-Host "  Save interval:     every $saveInterval min"
           Write-Host "  Upgrade openclaw:  Cancel workflow from GitHub Actions UI"
           
           if ((Get-Date) -ge $chainTime) {
@@ -1002,11 +953,29 @@ jobs:
           }
           
           # Track state
+          $lastSaveTime = Get-Date
           $chainTriggered = $false
           $loopCount = 0
           # GC interval: force garbage collection every 30 iterations (~30 min)
           # to prevent PowerShell memory accumulation over 5+ hour sessions
           $gcInterval = 30
+          
+          # Helper: save secrets to GitHub
+          function Save-Secrets {
+            $configFile = "$rdpUserHome\.openclaw\openclaw.json"
+            $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
+            try {
+              if (Test-Path $configFile) {
+                Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo 2>&1 | Out-Null
+              }
+              if (Test-Path $authFile) {
+                Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo 2>&1 | Out-Null
+              }
+              Write-Host "  [SAVE] Secrets saved at $(Get-Date -Format 'HH:mm:ss')"
+            } catch {
+              Write-Host "  [SAVE] WARNING: Secret save failed: $_"
+            }
+          }
           
           # Helper: trigger next session
           function Trigger-Chain {
@@ -1062,6 +1031,7 @@ jobs:
           }
           
           # Main keep-alive loop: runs from setup completion until hard limit
+          # At chainTime: saves secrets + triggers next session, then continues as phase 2
           while ((Get-Date) -lt $hardLimitTime) {
             $loopCount++
             $elapsed = [math]::Round(((Get-Date) - $jobStart).TotalMinutes, 1)
@@ -1202,12 +1172,20 @@ jobs:
               # After giving up, stay silent (no spam every 60s)
             }
             
+            # Periodic secret save
+            $sinceLastSave = ((Get-Date) - $lastSaveTime).TotalMinutes
+            if ($sinceLastSave -ge $saveInterval) {
+              Save-Secrets
+              $lastSaveTime = Get-Date
+            }
+            
             # Chain trigger: fire once when we reach chain time
             if (-not $chainTriggered -and (Get-Date) -ge $chainTime) {
               Write-Host ""
               Write-Host "=========================================="
-              Write-Host "  CHAIN TIME - triggering next session"
+              Write-Host "  CHAIN TIME - saving and triggering"
               Write-Host "=========================================="
+              Save-Secrets
               $chainTriggered = Trigger-Chain
               if ($chainTriggered) {
                 # Write marker so if: always() steps know chain was already done
@@ -1233,11 +1211,37 @@ jobs:
             Start-Sleep -Seconds 60
           }
           
-          # Final exit marker before leaving the job
-          Write-Host "Hard limit reached - exiting keepalive"
+          # Final save before exiting
+          Write-Host "Hard limit reached - final secret save"
+          Save-Secrets
           if (-not $chainTriggered) {
             echo "CHAIN_DONE=false" >> $env:GITHUB_OUTPUT
           }
+
+      - name: Save secrets (fallback)
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          $rdpUserHome = "C:\Users\rdpuser"
+          $repo = "${{ github.repository }}"
+          $configFile = "$rdpUserHome\.openclaw\openclaw.json"
+          $authFile = "$rdpUserHome\.openclaw\agents\main\agent\auth-profiles.json"
+          
+          Write-Host "Fallback secret save (in case keepalive was interrupted)..."
+          try {
+            if (Test-Path $configFile) {
+              Get-Content $configFile -Raw | gh secret set OPENCLAW_CONFIG --repo $repo
+            }
+            if (Test-Path $authFile) {
+              Get-Content $authFile -Raw | gh secret set OPENCLAW_AUTH_PROFILES --repo $repo
+            }
+            Write-Host "Secrets saved"
+          } catch {
+            Write-Host "WARNING: Secret save failed: $_"
+          }
+        continue-on-error: true
 
       - name: Clean workspace before upload
         if: always()
@@ -1403,7 +1407,7 @@ jobs:
       # ========== EXPLICIT CACHE SAVE ==========
       # actions/cache/restore does not register a post-hook, so we must save
       # explicitly. These are fallback saves - the keepalive loop handles
-      # chain triggering inline.
+      # chain triggering and secret saves inline.
 
       - name: Save Tailscale installer cache
         if: ${{ always() && steps.cache-tailscale.outputs.cache-hit != 'true' }}
