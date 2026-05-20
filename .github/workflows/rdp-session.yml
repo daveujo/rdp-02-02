@@ -480,7 +480,7 @@ jobs:
             $configBase64 = ($configMeta.content -replace "`n", "")
             $config = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($configBase64))
           } catch {
-            Write-Host "ERROR: Failed to load $configRepo/$configPath: $_"
+            Write-Host "ERROR: Failed to load ${configRepo}/${configPath}: $($_.Exception.Message)"
             exit 1
           }
 
