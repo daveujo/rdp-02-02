@@ -776,10 +776,36 @@ jobs:
           $rdpUserHome = "${{ steps.rdpuser.outputs.RDPUSER_HOME }}"
           $password = $env:RDP_PASSWORD
           
-          # Create startup script (with stderr capture for crash diagnosis)
-          $scriptContent = '$env:PATH = "C:\Users\rdpuser\.npm-global;" + $env:PATH' + "`r`n"
-          $scriptContent += '$logFile = "C:\Users\rdpuser\.openclaw\gateway-crash.log"' + "`r`n"
-          $scriptContent += 'Start-Process -WindowStyle Hidden -FilePath "node" -ArgumentList "C:\Users\rdpuser\.npm-global\node_modules\openclaw\openclaw.mjs", "gateway" -WorkingDirectory "C:\Users\rdpuser\.openclaw" -RedirectStandardError $logFile'
+          # Create startup script (captures both stdout and stderr for crash diagnosis)
+          $scriptContent = @'
+          $ErrorActionPreference = "Stop"
+          $env:PATH = "__RDPUSERHOME__\.npm-global;" + $env:PATH
+          $logFile = "__RDPUSERHOME__\.openclaw\gateway-crash.log"
+          $openclawBin = "__RDPUSERHOME__\.npm-global\node_modules\openclaw\openclaw.mjs"
+          $workDir = "__RDPUSERHOME__\.openclaw"
+
+          "[$(Get-Date -Format o)] Starting OpenClaw gateway" | Out-File -FilePath $logFile -Encoding UTF8 -Append
+          if (-not (Test-Path $openclawBin)) {
+            "[$(Get-Date -Format o)] ERROR: missing $openclawBin" | Out-File -FilePath $logFile -Encoding UTF8 -Append
+            exit 1
+          }
+
+          Push-Location $workDir
+          try {
+            & node $openclawBin gateway *>> $logFile
+            $exitCode = $LASTEXITCODE
+            "[$(Get-Date -Format o)] OpenClaw gateway exited with code $exitCode" | Out-File -FilePath $logFile -Encoding UTF8 -Append
+            exit $exitCode
+          } catch {
+            "[$(Get-Date -Format o)] ERROR: $($_.Exception.Message)" | Out-File -FilePath $logFile -Encoding UTF8 -Append
+            if ($_.ScriptStackTrace) {
+              $_.ScriptStackTrace | Out-File -FilePath $logFile -Encoding UTF8 -Append
+            }
+            exit 1
+          } finally {
+            Pop-Location
+          }
+          '@ -replace '__RDPUSERHOME__', $rdpUserHome
           $scriptPath = "$rdpUserHome\start-openclaw.ps1"
           $scriptContent | Out-File -FilePath $scriptPath -Encoding UTF8
           
